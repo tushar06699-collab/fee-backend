@@ -3,3 +3,4 @@ flask-cors
 flask_sqlalchemy
 python-dotenv
 gunicorn
+openpyxl
