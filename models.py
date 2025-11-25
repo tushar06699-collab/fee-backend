@@ -1,23 +1,25 @@
-from flask_sqlalchemy import SQLAlchemy
+from extensions import db
 import json
 
-db = SQLAlchemy()
 
-# --------------------------------------------------------
+# ==========================================================
 # STUDENT MODEL
-# --------------------------------------------------------
+# ==========================================================
 class Student(db.Model):
+    __tablename__ = "student"
+
     id = db.Column(db.Integer, primary_key=True)
+
     name = db.Column(db.String(100))
     father = db.Column(db.String(100))
     class_name = db.Column(db.String(50))
     roll = db.Column(db.String(20))
+
     previous_due = db.Column(db.Integer, default=0)
     advance = db.Column(db.Integer, default=0)
-    months = db.Column(db.JSON)   # store monthly fee structure
 
-    # ❌ REMOVE THIS LINE
-    # receipts = db.relationship("Receipt", backref="student", lazy=True)
+    # months + annual_charge included here
+    months = db.Column(db.JSON)
 
     def to_dict(self):
         return {
@@ -28,19 +30,23 @@ class Student(db.Model):
             "roll": self.roll,
             "previous_due": self.previous_due,
             "advance": self.advance,
-            "months": self.months
+            "months": self.months or {},
         }
 
 
-# --------------------------------------------------------
-# FINAL + ONLY Receipt MODEL
-# --------------------------------------------------------
+# ==========================================================
+# RECEIPT MODEL
+# ==========================================================
 class Receipt(db.Model):
     __tablename__ = "receipt"
 
     id = db.Column(db.Integer, primary_key=True)
 
-    student_id = db.Column(db.Integer,db.ForeignKey("student.id"), nullable=True)
+    student_id = db.Column(
+        db.Integer,
+        db.ForeignKey("student.id"),
+        nullable=True
+    )
 
     name = db.Column(db.String(100))
     father = db.Column(db.String(100))
@@ -53,10 +59,17 @@ class Receipt(db.Model):
     total_due = db.Column(db.Integer, default=0)
     advance = db.Column(db.Integer, default=0)
 
+    # Annual charge collected in this receipt
+    annual_charge = db.Column(db.Integer, default=0)
+
+    # Full months breakdown
     months_json = db.Column(db.Text)
 
+    # Prevent duplicate receipts
     receipt_key = db.Column(db.String(200), unique=True)
 
+    # 🔥 THE MISSING FIELD (THIS FIXES EVERYTHING)
+    receipt_number = db.Column(db.String(200))
 
     def to_dict(self):
         return {
@@ -70,16 +83,25 @@ class Receipt(db.Model):
             "total_paid": self.total_paid,
             "total_due": self.total_due,
             "advance": self.advance,
-            "months": json.loads(self.months_json) if self.months_json else []
+            "annual_charge": self.annual_charge,
+            "months": json.loads(self.months_json) if self.months_json else {},
+            "receipt_number": self.receipt_number
         }
 
+# ==========================================================
+# FEE STRUCTURE MODEL
+# ==========================================================
 class FeeStructure(db.Model):
+    __tablename__ = "fee_structure"
+
     id = db.Column(db.Integer, primary_key=True)
     class_name = db.Column(db.String(50), unique=True)
     monthly_fee = db.Column(db.Integer, default=0)
+    annual_charge = db.Column(db.Integer, default=0)  # ✅ REQUIRED FIELD
 
     def to_dict(self):
         return {
             "class_name": self.class_name,
-            "monthly_fee": self.monthly_fee
+            "monthly_fee": self.monthly_fee,
+            "annual_charge": self.annual_charge  # ✅ MUST RETURN
         }
