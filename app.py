@@ -3,6 +3,8 @@ import os
 import json
 import traceback
 import sqlite3
+import time
+
 from typing import Dict, Any
 
 from flask import Flask, request, jsonify, make_response
@@ -11,6 +13,12 @@ from extensions import db                # your SQLAlchemy() from extensions.py
 from models import Student, Receipt, FeeStructure
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+import pickle
+
 
 # ------------------------
 # Config / Sessions setup
@@ -219,20 +227,21 @@ def normalize_months_structure(months):
 
 def calc_carry_forward_amount(student_row):
     """
-    NEW LOGIC:
-    Only carry unpaid monthly dues to next session.
-    Ignore previous_due originally entered when student was created.
+    Carry forward previous_due + all unpaid monthly dues.
     """
     months = student_row.get("months") or {}
     months_norm = normalize_months_structure(months)
 
-    unpaid_sum = 0
-    for mrec in months_norm.values():
-        # only use monthly 'due' values
-        due_amt = int(mrec.get("due", 0) or 0)
-        unpaid_sum += due_amt
+    # old previous due
+    prev_due = int(student_row.get("previous_due") or 0)
 
-    return unpaid_sum   # ❗ONLY unpaid months carried forward
+    # unpaid monthly dues
+    unpaid_months = 0
+    for mrec in months_norm.values():
+        due_amt = int(mrec.get("due", 0) or 0)
+        unpaid_months += due_amt
+
+    return prev_due + unpaid_months
 
 def copy_students_from_previous(new_session_name: str):
     prev = get_previous_session_name(new_session_name)
@@ -328,6 +337,32 @@ def copy_students_from_previous(new_session_name: str):
                     "annual_charge": 0
                 })
 
+def get_drive_service():
+    SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+    creds = None
+
+    # Load token if exists
+    if os.path.exists("token.pickle"):
+        with open("token.pickle", "rb") as token:
+            creds = pickle.load(token)
+
+    # If no valid token → login
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                "credentials.json", SCOPES
+            )
+            creds = flow.run_local_server(port=0)
+
+        # Save new token
+        with open("token.pickle", "wb") as token:
+            pickle.dump(creds, token)
+
+    return build("drive", "v3", credentials=creds)
+                
+
 # ------------------------
 # before_request: allow preflight and ensure session exists
 # ------------------------
@@ -376,20 +411,22 @@ def create_auto_session():
     except Exception:
         return jsonify({"success": False, "message": "Invalid session format"}), 400
 
-    # Ensure DB exists -> ensure_session_db_exists will copy students once if the DB is newly created
     ensure_session_db_exists(new_session)
 
-    # If user wants to add an extra fee, add to previous_due for all students
     if extra_fee != 0:
         new_engine = get_engine_for_session(new_session)
         with new_engine.begin() as conn:
             conn.execute(text("UPDATE student SET previous_due = previous_due + :fee"), {"fee": extra_fee})
 
     return jsonify({"success": True, "new_session": new_session})
-
 # ------------------------
 # Basic routes
 # ------------------------
+@app.route("/debug/list_dbs")
+def debug_list_dbs():
+    return jsonify(os.listdir(SESSIONS_DIR))
+
+
 @app.route("/")
 def home():
     s = get_session_from_request()
@@ -403,6 +440,73 @@ def health():
 # ------------------------
 # STUDENT endpoints
 # ------------------------
+def upload_session_db_to_drive(session_name):
+    # Always use the same helper used everywhere else
+    db_file = session_db_path(session_name)
+
+    if not os.path.exists(db_file):
+        return {
+            "success": False,
+            "message": f"Database file not found for session {session_name}: {db_file}"
+        }
+
+    try:
+        service = get_drive_service()
+
+        file_metadata = {
+            "name": f"{session_name}_backup.db",
+            "mimeType": "application/octet-stream"
+        }
+
+        media = MediaFileUpload(db_file, resumable=True)
+
+        uploaded = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields="id"
+        ).execute()
+
+        return {
+            "success": True,
+            "message": f"Backup uploaded successfully for session {session_name}",
+            "file_id": uploaded.get("id")
+        }
+
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+@app.route("/backup/save_all_to_drive", methods=["POST"])
+def backup_all_sessions_to_drive():
+    try:
+        files = []
+
+        # Loop through session directory
+        for file in os.listdir(SESSIONS_DIR):
+            if file.endswith(".db"):
+                session_name = file.replace("school_", "").replace(".db", "")
+                
+                result = upload_session_db_to_drive(session_name)
+
+                files.append({
+                    "session": session_name,
+                    "success": result.get("success"),
+                    "message": result.get("message"),
+                    "file_id": result.get("file_id")
+                })
+
+        return jsonify({
+            "success": True,
+            "message": "All backups completed",
+            "files": files
+        })
+
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "message": str(e)
+        }), 500
+
+
 @app.route("/student/add", methods=["POST"])
 def add_student():
     data = request.get_json()
@@ -583,6 +687,48 @@ def delete_student():
             conn.execute(text("DELETE FROM receipt WHERE class_name=:cls AND roll=:roll"), {"cls": cls, "roll": roll})
             conn.execute(text("DELETE FROM student WHERE class_name=:cls AND roll=:roll"), {"cls": cls, "roll": roll})
             return jsonify({"success": True, "message": "Deleted"})
+        
+@app.route("/delete_session", methods=["POST"])
+def delete_session():
+    try:
+        session_name = request.headers.get("X-Session")
+        if not session_name:
+            return jsonify({"success": False, "message": "Session name missing"})
+
+        db_path = os.path.join(SESSIONS_DIR, f"school_{session_name}.db")
+
+        if not os.path.exists(db_path):
+            return jsonify({"success": False, "message": "Session not found"})
+
+        # Dispose SQLAlchemy engine if exists
+        engine = ENGINES.get(session_name)
+        if engine:
+            try:
+                engine.dispose()
+            except:
+                pass
+            ENGINES.pop(session_name, None)
+            SESSIONMAKERS.pop(session_name, None)
+
+        # Force SQLite unlock  
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.execute("PRAGMA journal_mode=DELETE;")
+            conn.close()
+        except:
+            pass
+
+        # Try deleting (Windows fix)
+        try:
+            os.remove(db_path)
+        except PermissionError:
+            time.sleep(0.3)
+            os.remove(db_path)
+
+        return jsonify({"success": True, "message": "Session deleted successfully"})
+
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)})
 
 # ------------------------
 # RECEIPTS endpoints (with payment application logic)
@@ -635,12 +781,9 @@ def add_receipt():
             if key not in data:
                 return jsonify({"success": False, "message": f"Missing {key}"}), 400
 
-        # Current session name
         sname = get_session_from_request()
 
-        # -------------------------------
         # Normalize months
-        # -------------------------------
         months_raw = data.get("months", {})
         months = {}
 
@@ -657,7 +800,6 @@ def add_receipt():
                     "extra": int(item.get("extra", 0)),
                     "date": item.get("date", "")
                 }
-
         elif isinstance(months_raw, dict):
             for k, v in months_raw.items():
                 if not isinstance(v, dict):
@@ -673,19 +815,14 @@ def add_receipt():
                         "date": v.get("date", "")
                     }
 
-        else:
-            months = {}
-
         months_json = json.dumps(months)
         annual_paid = int(months.get("Annual", {}).get("paid", 0))
 
-        # =========================================================
-        # 🟢 DEFAULT SESSION — ORM
-        # =========================================================
+        # =====================
+        # DEFAULT SESSION → ORM
+        # =====================
         if sname == DEFAULT_SESSION:
             with app.app_context():
-
-                # Duplicate check
                 existing = Receipt.query.filter_by(receipt_key=data["receiptKey"]).first()
                 if existing:
                     return jsonify({
@@ -694,13 +831,7 @@ def add_receipt():
                         "receipt_number": existing.receipt_number
                     })
 
-                # Generate new receipt number
-                last = Receipt.query.order_by(Receipt.id.desc()).first()
-                seq = (last.id + 1) if last else 1
-
-                receipt_number = f"{sname}-{data['class']}-{data['roll']}-{seq:06d}"
-
-                # Save receipt
+                # Create receipt without receipt_number first
                 r = Receipt(
                     student_id=None,
                     name=data["name"],
@@ -713,10 +844,11 @@ def add_receipt():
                     advance=int(data["advance"]),
                     months_json=months_json,
                     receipt_key=data["receiptKey"],
-                    annual_charge=annual_paid,
-                    receipt_number=receipt_number
+                    annual_charge=annual_paid
                 )
                 db.session.add(r)
+                db.session.flush()  # Assigns r.id from DB
+                r.receipt_number = f"{sname}-{data['class']}-{data['roll']}-{r.id:06d}"
                 db.session.commit()
 
                 # Update student monthly dues
@@ -724,7 +856,6 @@ def add_receipt():
                     class_name=data["class"],
                     roll=str(data["roll"])
                 ).first()
-
                 if student:
                     current_months = ensure_months_normalized(student.months or {})
                     prev_due = int(student.previous_due or 0)
@@ -742,19 +873,18 @@ def add_receipt():
                 return jsonify({
                     "success": True,
                     "message": "Receipt saved",
-                    "receipt_number": receipt_number
+                    "receipt_number": r.receipt_number
                 })
 
-        # =========================================================
-        # 🔵 NON-DEFAULT SESSION — RAW SQL
-        # =========================================================
+        # =====================
+        # NON-DEFAULT SESSION → RAW SQL
+        # =====================
         else:
             engine = get_engine_for_session(sname)
             if not engine:
                 return jsonify({"success": False, "message": "Session engine missing"}), 500
 
             with engine.begin() as conn:
-
                 # Duplicate check
                 chk = conn.execute(text(
                     "SELECT receipt_number FROM receipt WHERE receipt_key=:rk"
@@ -767,24 +897,17 @@ def add_receipt():
                         "receipt_number": chk[0]
                     })
 
-                # Generate next receipt number
-                last = conn.execute(text(
-                    "SELECT id FROM receipt ORDER BY id DESC LIMIT 1"
-                )).fetchone()
-
-                seq = (last[0] + 1) if last else 1
-                receipt_number = f"{sname}-{data['class']}-{data['roll']}-{seq:06d}"
-
-                # Insert receipt
-                conn.execute(text("""
+                # Insert without receipt_number first, get inserted id
+                res = conn.execute(text("""
                     INSERT INTO receipt
                     (student_id, name, father, class_name, roll, date,
                      total_paid, total_due, advance, months_json,
-                     receipt_key, annual_charge, receipt_number)
+                     receipt_key, annual_charge)
                     VALUES
                     (:sid, :name, :father, :cls, :roll, :date,
                      :paid, :due, :adv, :months,
-                     :rk, :annual, :rno)
+                     :rk, :annual)
+                    RETURNING id
                 """), {
                     "sid": None,
                     "name": data["name"],
@@ -797,31 +920,33 @@ def add_receipt():
                     "adv": int(data["advance"]),
                     "months": months_json,
                     "rk": data["receiptKey"],
-                    "annual": annual_paid,
-                    "rno": receipt_number
+                    "annual": annual_paid
                 })
+
+                rid = res.fetchone()[0]
+                receipt_number = f"{sname}-{data['class']}-{data['roll']}-{rid:06d}"
+
+                # Update receipt_number
+                conn.execute(text("""
+                    UPDATE receipt SET receipt_number=:rno WHERE id=:rid
+                """), {"rno": receipt_number, "rid": rid})
 
                 # Update student
                 st_row = conn.execute(text("""
                     SELECT id, previous_due, months 
                     FROM student 
                     WHERE class_name=:cls AND roll=:roll
-                """), {
-                    "cls": data["class"],
-                    "roll": str(data["roll"])
-                }).fetchone()
+                """), {"cls": data["class"], "roll": str(data["roll"])}).fetchone()
 
                 if st_row:
                     m = st_row._mapping
                     prev = int(m["previous_due"] or 0)
-
                     try:
                         cur_months = json.loads(m["months"])
                     except:
                         cur_months = {}
 
                     paid = int(data["totalPaid"])
-
                     new_months, new_prev, _ = apply_payment_to_student_months_and_prev(
                         cur_months, prev, paid
                     )
@@ -837,12 +962,11 @@ def add_receipt():
                         "id": m["id"]
                     })
 
-            # Return for non-default session
-            return jsonify({
-                "success": True,
-                "message": "Receipt saved",
-                "receipt_number": receipt_number
-            })
+                return jsonify({
+                    "success": True,
+                    "message": "Receipt saved",
+                    "receipt_number": receipt_number
+                })
 
     except Exception as e:
         print(traceback.format_exc())
@@ -1249,6 +1373,7 @@ def export_excel():
         as_attachment=True,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
 
 
 # ------------------------
