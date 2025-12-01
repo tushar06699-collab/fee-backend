@@ -1157,6 +1157,18 @@ def setup_fees():
                     conn.execute(text("INSERT INTO fee_structure (class_name, monthly_fee) VALUES (:cls, :m)"), {"cls": c, "m": fee})
             return jsonify({"success": True, "message": "Inserted"})
 
+@app.route("/getClassList/<session_name>")
+def get_class_list(session_name):
+    # Query all students for the session, collect unique class_name
+    engine = get_engine_for_session(session_name)
+    if not engine:
+        return jsonify([]), 404
+    with engine.connect() as conn:
+        rows = conn.execute(text("SELECT DISTINCT class_name FROM student")).fetchall()
+        classes = [{"class_name": r._mapping["class_name"]} for r in rows]
+    return jsonify(classes)
+
+
 # ------------------------
 # SESSION LIST
 # ------------------------
@@ -1225,6 +1237,7 @@ MONTHS_ORDER = [
     "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar",
     "previousDue"
 ]
+
 
 @app.route("/export/excel")
 def export_excel():
