@@ -1,371 +1,376 @@
-# app.py
-import os
+﻿
+import io
 import json
+import os
+import re
 import traceback
-import sqlite3
-import time
+from datetime import datetime
+from typing import Any, Dict, List
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
-from typing import Dict, Any
-
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, jsonify, make_response, request, send_file
 from flask_cors import CORS
-from extensions import db                # your SQLAlchemy() from extensions.py
-from models import Student, Receipt, FeeStructure
-from sqlalchemy import create_engine, text
-from sqlalchemy.orm import sessionmaker
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
-import pickle
+from openpyxl import Workbook
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
-
-# ------------------------
-# Config / Sessions setup
-# ------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
-os.makedirs(SESSIONS_DIR, exist_ok=True)
-
-DEFAULT_SESSION = "2024_25"
+DEFAULT_SESSION = os.getenv("DEFAULT_SESSION", "2024_25")
 CURRENT_SESSION = DEFAULT_SESSION
+# MongoDB connection (hardcoded like exam backend)
+MONGO_URI = "mongodb+srv://PSPS:2007@fee.4uslzr2.mongodb.net/?retryWrites=true&w=majority&appName=fee"
+MONGO_DB_NAME = "school_fee"
 
-# cache engines and sessionmakers for non-default sessions
-ENGINES = {}
-SESSIONMAKERS = {}
+client = None
+db = None
+MONGO_INIT_ERROR = None
+try:
+    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+    db = client[MONGO_DB_NAME]
+    client.admin.command("ping")
+except Exception as e:
+    MONGO_INIT_ERROR = str(e)
 
-def session_db_filename(session_name: str) -> str:
-    safe = "".join(ch for ch in session_name if ch.isalnum() or ch in ("_", "-"))
-    return f"school_{safe}.db"
-
-def session_db_path(session_name: str) -> str:
-    return os.path.join(SESSIONS_DIR, session_db_filename(session_name))
-
-def get_db_uri_for_session(session_name: str) -> str:
-    return "sqlite:///" + session_db_path(session_name)
-
-def get_previous_session_name(session_name: str):
-    try:
-        parts = session_name.split("_")
-        if len(parts) != 2:
-            return None
-        start = int(parts[0])
-        prev_start = start - 1
-        prev_end = prev_start + 1
-        prev_end_str = str(prev_end)[2:]  # last two digits
-        return f"{prev_start}_{prev_end_str}"
-    except Exception:
-        return None
-
-# ------------------------
-# Monthly + Annual default structure
-# ------------------------
-def default_month_structure():
-    return {
-        "Jan": {"status": "Due", "paid": 0, "due": 0},
-        "Feb": {"status": "Due", "paid": 0, "due": 0},
-        "Mar": {"status": "Due", "paid": 0, "due": 0},
-        "Apr": {"status": "Due", "paid": 0, "due": 0},
-        "May": {"status": "Due", "paid": 0, "due": 0},
-        "Jun": {"status": "Due", "paid": 0, "due": 0},
-        "Jul": {"status": "Due", "paid": 0, "due": 0},
-        "Aug": {"status": "Due", "paid": 0, "due": 0},
-        "Sep": {"status": "Due", "paid": 0, "due": 0},
-        "Oct": {"status": "Due", "paid": 0, "due": 0},
-        "Nov": {"status": "Due", "paid": 0, "due": 0},
-        "Dec": {"status": "Due", "paid": 0, "due": 0},
-        "Annual": {"status": "Due", "paid": 0, "due": 0},
-    }
-
-def ensure_months_has_annual(months):
-    if not isinstance(months, dict):
-        months = {}
-    if "Annual" not in months:
-        months["Annual"] = {"status": "Due", "paid": 0, "due": 0}
-    return months
-
-def ensure_months_normalized(months):
-    m = months or {}
-    for k, v in default_month_structure().items():
-        if k not in m:
-            m[k] = v.copy()
-        else:
-            # normalize inner dict
-            if not isinstance(m[k], dict):
-                m[k] = v.copy()
-            else:
-                m[k]["status"] = m[k].get("status", "Due")
-                m[k]["paid"] = int(m[k].get("paid", 0) or 0)
-                m[k]["due"] = int(m[k].get("due", 0) or 0)
-    return m
-
-def ensure_session_db_exists(session_name: str):
-    """
-    Create DB file if missing, ensure tables exist and minimal columns present.
-    If created == True, copy students from previous session once.
-    """
-    db_file = session_db_path(session_name)
-    created = False
-
-    if not os.path.exists(db_file):
-        open(db_file, "a").close()
-        created = True
-
-    if session_name != DEFAULT_SESSION:
-        if session_name not in ENGINES:
-            uri = get_db_uri_for_session(session_name)
-            engine = create_engine(uri, connect_args={"check_same_thread": False})
-            ENGINES[session_name] = engine
-            SESSIONMAKERS[session_name] = sessionmaker(bind=engine)
-
-            # create tables if missing
-            db.metadata.create_all(engine)
-
-            # safe ALTERs for missing columns
-            with engine.connect() as conn:
-                try:
-                    conn.execute(text("ALTER TABLE student ADD COLUMN annual_charge INTEGER DEFAULT 0"))
-                except Exception:
-                    pass
-                try:
-                    conn.execute(text("ALTER TABLE student ADD COLUMN months TEXT"))
-                except Exception:
-                    pass
-                try:
-                    conn.execute(text("ALTER TABLE receipt ADD COLUMN receipt_number TEXT"))
-                except Exception:
-                    pass
-
-    # copy previous session only when db was newly created
-    if created:
-        try:
-            copy_students_from_previous(session_name)
-        except Exception:
-            print("Carry forward failed for", session_name)
-            print(traceback.format_exc())
-
-    return {"created": created, "db_file": db_file}
-
-def get_engine_for_session(session_name: str):
-    ensure_session_db_exists(session_name)
-    if session_name == DEFAULT_SESSION:
-        return db.engine
-    return ENGINES.get(session_name)
-
-def get_sessionmaker_for_session(session_name: str):
-    ensure_session_db_exists(session_name)
-    if session_name == DEFAULT_SESSION:
-        return None
-    return SESSIONMAKERS.get(session_name)
-
-# ------------------------
-# Flask init
-# ------------------------
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["SQLALCHEMY_DATABASE_URI"] = get_db_uri_for_session(DEFAULT_SESSION)
-db.init_app(app)
+MONTHS_ORDER = ["Annual", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "previousDue"]
+EXAM_MONTHS_ORDER = ["Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar"]
+DEFAULT_CLASSES = ["Nursery", "LKG", "UKG", "1st", "2nd", "3rd", "4th", "5th", "6th", "7th", "8th", "9th", "10th", "11th Arts", "12th Arts"]
 
-with app.app_context():
-    db.create_all()
 
-# ------------------------
-# Helpers
-# ------------------------
-def row_to_student_dict(mapping: Dict[str, Any]):
-    months_val = mapping.get("months")
-    months = {}
-    if months_val:
-        if isinstance(months_val, (str, bytes)):
-            try:
-                months = json.loads(months_val)
-            except Exception:
-                months = {}
-        elif isinstance(months_val, dict):
-            months = months_val
-        else:
-            months = {}
-    annual = mapping.get("annual_charge")
-    if annual is None:
-        try:
-            annual_struct = months.get("Annual") if isinstance(months, dict) else None
-            annual = int(annual_struct.get("paid", 0)) if annual_struct else 0
-        except Exception:
-            annual = 0
+def students_col():
+    return db["students"]
 
+
+def receipts_col():
+    return db["receipts"]
+
+
+def fees_col():
+    return db["fee_structure"]
+
+
+def sessions_col():
+    return db["sessions"]
+
+
+def counters_col():
+    return db["counters"]
+
+
+def exam_cfg_col():
+    return db["exam_fee_config"]
+
+
+def ensure_indexes():
+    students_col().create_index([("session", ASCENDING), ("class_name", ASCENDING), ("roll", ASCENDING)], unique=True)
+    students_col().create_index([("session", ASCENDING), ("id", ASCENDING)], unique=True)
+    receipts_col().create_index([("session", ASCENDING), ("receipt_key", ASCENDING)], unique=True)
+    receipts_col().create_index([("session", ASCENDING), ("id", ASCENDING)], unique=True)
+    fees_col().create_index([("session", ASCENDING), ("class_name", ASCENDING)], unique=True)
+    exam_cfg_col().create_index([("session", ASCENDING)], unique=True)
+    sessions_col().create_index([("name", ASCENDING)], unique=True)
+
+
+def get_next_sequence(key: str) -> int:
+    doc = counters_col().find_one_and_update({"_id": key}, {"$inc": {"seq": 1}}, upsert=True, return_document=ReturnDocument.AFTER)
+    return int(doc.get("seq", 1))
+
+
+def sanitize_session_name(name: str) -> str:
+    if not name:
+        return CURRENT_SESSION
+    safe = "".join(ch for ch in name if ch.isalnum() or ch in ("_", "-"))
+    return safe or CURRENT_SESSION
+
+
+def to_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def normalize_class_name(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def fetch_master_students_for_session(session_name: str):
+    """Fetch master students from students backend (best-effort)."""
+    base = os.getenv("STUDENT_API_URL", "https://student-backend-117372286918.asia-south1.run.app/").strip()
+    if not base:
+        return []
+    base = base.rstrip("/")
+    url = f"{base}/students?session={quote(session_name)}"
+    try:
+        req = Request(url, headers={"Accept": "application/json"})
+        with urlopen(req, timeout=8) as resp:
+            raw = resp.read().decode("utf-8")
+        payload = json.loads(raw)
+        rows = payload if isinstance(payload, list) else (payload.get("students") if isinstance(payload, dict) else [])
+        if not isinstance(rows, list):
+            return []
+        return rows
+    except Exception:
+        return []
+
+
+def get_session_from_request() -> str:
+    return sanitize_session_name(request.headers.get("X-Session") or request.args.get("session") or CURRENT_SESSION)
+
+
+def get_previous_session_name(session_name: str):
+    try:
+        s, _ = session_name.split("_")
+        start = int(s) - 1
+        end = start + 1
+        return f"{start}_{str(end)[2:]}"
+    except Exception:
+        return None
+
+
+def default_month_structure():
     return {
-        "id": mapping.get("id"),
-        "name": mapping.get("name"),
-        "father": mapping.get("father"),
-        "class_name": mapping.get("class_name"),
-        "roll": mapping.get("roll"),
-        "previous_due": int(mapping.get("previous_due") or 0),
-        "advance": int(mapping.get("advance") or 0),
-        "months": months,
-        "annual_charge": int(annual or 0)
+        "Jan": {"status": "Due", "paid": 0, "due": 0}, "Feb": {"status": "Due", "paid": 0, "due": 0},
+        "Mar": {"status": "Due", "paid": 0, "due": 0}, "Apr": {"status": "Due", "paid": 0, "due": 0},
+        "May": {"status": "Due", "paid": 0, "due": 0}, "Jun": {"status": "Due", "paid": 0, "due": 0},
+        "Jul": {"status": "Due", "paid": 0, "due": 0}, "Aug": {"status": "Due", "paid": 0, "due": 0},
+        "Sep": {"status": "Due", "paid": 0, "due": 0}, "Oct": {"status": "Due", "paid": 0, "due": 0},
+        "Nov": {"status": "Due", "paid": 0, "due": 0}, "Dec": {"status": "Due", "paid": 0, "due": 0},
+        "Annual": {"status": "Due", "paid": 0, "due": 0},
     }
 
-def normalize_months_structure(months):
-    out = {}
-    if not months:
-        return out
-    if isinstance(months, dict):
-        for k, v in months.items():
-            if v is None:
-                out[k] = {"status": "Due", "paid": 0, "due": 0}
-                continue
-            if isinstance(v, dict):
-                status = v.get("status", "Due")
-                paid = int(v.get("paid", 0) or 0)
-                due = int(v.get("due", 0) or 0)
-                out[k] = {"status": status, "paid": paid, "due": due}
-            else:
-                out[k] = {"status": "Due", "paid": 0, "due": 0}
+
+def ensure_months_normalized(months: Any):
+    out = months if isinstance(months, dict) else {}
+    for k, v in default_month_structure().items():
+        if k not in out or not isinstance(out[k], dict):
+            out[k] = v.copy()
+            out[k]["exam_fee_applied"] = 0
+        else:
+            out[k]["status"] = out[k].get("status", "Due")
+            out[k]["paid"] = int(out[k].get("paid", 0) or 0)
+            out[k]["due"] = int(out[k].get("due", 0) or 0)
+            out[k]["exam_fee_applied"] = int(out[k].get("exam_fee_applied", 0) or 0)
     return out
 
-def calc_carry_forward_amount(student_row):
-    """
-    Carry forward previous_due + all unpaid monthly dues.
-    """
-    months = student_row.get("months") or {}
-    months_norm = normalize_months_structure(months)
 
-    # old previous due
-    prev_due = int(student_row.get("previous_due") or 0)
+def sanitize_discount_config(raw: Any) -> Dict[str, Any]:
+    cfg = raw if isinstance(raw, dict) else {}
+    dtype = str(cfg.get("type", "fixed") or "fixed").strip().lower()
+    if dtype not in {"fixed", "percentage"}:
+        dtype = "fixed"
+    scope = str(cfg.get("scope", "monthly") or "monthly").strip().lower()
+    if scope not in {"monthly", "annual", "admission", "all"}:
+        scope = "monthly"
+    value = int(cfg.get("value", 0) or 0)
+    if value < 0:
+        value = 0
+    note = str(cfg.get("note", "") or "").strip()[:300]
+    return {
+        "enabled": bool(cfg.get("enabled", False)),
+        "type": dtype,
+        "value": value,
+        "scope": scope,
+        "note": note,
+    }
 
-    # unpaid monthly dues
-    unpaid_months = 0
-    for mrec in months_norm.values():
-        due_amt = int(mrec.get("due", 0) or 0)
-        unpaid_months += due_amt
 
-    return prev_due + unpaid_months
+def normalize_exam_months(raw: Any) -> List[str]:
+    if not isinstance(raw, list):
+        return []
+    out = []
+    seen = set()
+    for item in raw:
+        m = str(item or "").strip()
+        if m not in EXAM_MONTHS_ORDER:
+            continue
+        if m in seen:
+            continue
+        seen.add(m)
+        out.append(m)
+    out.sort(key=lambda x: EXAM_MONTHS_ORDER.index(x))
+    return out
 
-def copy_students_from_previous(new_session_name: str):
-    prev = get_previous_session_name(new_session_name)
-    if not prev:
-        print("No previous session computed for", new_session_name)
-        return
 
-    prev_path = session_db_path(prev)
-    if not os.path.exists(prev_path):
-        print("Previous session DB not found:", prev_path)
-        return
-
-    print(f"Carry-forward: copying students from {prev} -> {new_session_name}")
-
-    prev_engine = get_engine_for_session(prev)
-    prev_students = []
-
-    if prev == DEFAULT_SESSION:
-        with app.app_context():
-            s_objs = Student.query.all()
-            for s in s_objs:
-                prev_students.append({
-                    "name": s.name,
-                    "father": s.father,
-                    "class_name": s.class_name,
-                    "roll": s.roll,
-                    "previous_due": int(s.previous_due or 0),
-                    "advance": int(s.advance or 0),
-                    "months": s.months or {},
-                    "annual_charge": 0
-                })
-    else:
-        with prev_engine.connect() as conn:
-            rows = conn.execute(text("SELECT id, name, father, class_name, roll, previous_due, advance, months, annual_charge FROM student")).fetchall()
-            for r in rows:
-                m = r._mapping
-                months_val = m.get("months")
-                months = {}
-                if months_val:
-                    try:
-                        months = json.loads(months_val) if isinstance(months_val, (str, bytes)) else months_val
-                    except Exception:
-                        months = {}
-                prev_students.append({
-                    "name": m.get("name"),
-                    "father": m.get("father"),
-                    "class_name": m.get("class_name"),
-                    "roll": m.get("roll"),
-                    "previous_due": int(m.get("previous_due") or 0),
-                    "advance": int(m.get("advance") or 0),
-                    "months": months,
-                    "annual_charge": int(m.get("annual_charge") or 0)
-                })
-
-    new_engine = get_engine_for_session(new_session_name)
-    if new_session_name == DEFAULT_SESSION:
-        with app.app_context():
-            for s in prev_students:
-                exists = Student.query.filter_by(class_name=s["class_name"], roll=str(s["roll"])).first()
-                if exists:
+def normalize_exam_config(raw: Any) -> List[Dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    out: List[Dict[str, Any]] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "") or "").strip()[:80] or f"Exam {i + 1}"
+        months = normalize_exam_months(item.get("months", []))
+        fees_in = item.get("class_fees", {})
+        class_fees: Dict[str, int] = {}
+        if isinstance(fees_in, dict):
+            for k, v in fees_in.items():
+                cls = normalize_class_name(k)
+                if not cls:
                     continue
-                carry = calc_carry_forward_amount(s)
-                new_student = Student(
-                    name=s["name"],
-                    father=s["father"],
-                    class_name=s["class_name"],
-                    roll=str(s["roll"]),
-                    previous_due=carry,
-                    advance=0,
-                    months=ensure_months_normalized(default_month_structure())
-                )
-                db.session.add(new_student)
-            db.session.commit()
-    else:
-        with new_engine.begin() as conn:
-            for s in prev_students:
-                existing = conn.execute(text("SELECT id FROM student WHERE class_name=:cls AND roll=:roll"), {"cls": s["class_name"], "roll": str(s["roll"])}).fetchone()
-                if existing:
-                    continue
-                carry = calc_carry_forward_amount(s)
-                months_json = json.dumps(ensure_months_normalized(default_month_structure()))
-                conn.execute(text(
-                    "INSERT INTO student (name, father, class_name, roll, previous_due, advance, months, annual_charge) "
-                    "VALUES (:name, :father, :class_name, :roll, :previous_due, :advance, :months, :annual_charge)"
-                ), {
-                    "name": s["name"],
-                    "father": s["father"],
-                    "class_name": s["class_name"],
-                    "roll": str(s["roll"]),
-                    "previous_due": carry,
-                    "advance": 0,
-                    "months": months_json,
-                    "annual_charge": 0
-                })
+                class_fees[cls] = max(0, to_int(v, 0))
+        out.append({"name": name, "months": months, "class_fees": class_fees})
+    return out
 
-def get_drive_service():
-    SCOPES = ["https://www.googleapis.com/auth/drive.file"]
-    creds = None
 
-    # Load token if exists
-    if os.path.exists("token.pickle"):
-        with open("token.pickle", "rb") as token:
-            creds = pickle.load(token)
+def exam_target_for_class_month(exams: List[Dict[str, Any]], cls: str, month: str) -> int:
+    total = 0
+    cls_norm = normalize_class_name(cls)
+    for ex in exams:
+        months = ex.get("months", [])
+        if month not in months:
+            continue
+        class_fees = ex.get("class_fees", {})
+        total += max(0, to_int(class_fees.get(cls_norm, 0), 0))
+    return total
 
-    # If no valid token → login
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                "credentials.json", SCOPES
+
+def apply_exam_config_to_students(session_name: str, exams: List[Dict[str, Any]]):
+    exams_norm = normalize_exam_config(exams)
+
+    docs = list(students_col().find({"session": session_name}))
+    for st in docs:
+        cls = normalize_class_name(st.get("class_name"))
+        months_obj = ensure_months_normalized(st.get("months") or {})
+
+        changed = False
+        for m in EXAM_MONTHS_ORDER:
+            rec = months_obj.get(m)
+            if not isinstance(rec, dict):
+                continue
+            target = exam_target_for_class_month(exams_norm, cls, m)
+            current = int(rec.get("exam_fee_applied", 0) or 0)
+            if target == current:
+                continue
+            delta = target - current
+            rec["due"] = max(0, int(rec.get("due", 0) or 0) + delta)
+            rec["exam_fee_applied"] = target
+            paid = int(rec.get("paid", 0) or 0)
+            due = int(rec.get("due", 0) or 0)
+            rec["status"] = "Paid" if due == 0 else ("Partial" if paid > 0 else "Due")
+            months_obj[m] = rec
+            changed = True
+
+        if changed:
+            students_col().update_one(
+                {"_id": st["_id"]},
+                {"$set": {"months": months_obj, "updated_at": datetime.utcnow()}},
             )
-            creds = flow.run_local_server(port=0)
 
-        # Save new token
-        with open("token.pickle", "wb") as token:
-            pickle.dump(creds, token)
 
-    return build("drive", "v3", credentials=creds)
-                
+def calc_carry_forward_amount(st: Dict[str, Any]) -> int:
+    prev = int(st.get("previous_due", 0) or 0)
+    months = ensure_months_normalized(st.get("months") or {})
+    return prev + sum(int(rec.get("due", 0) or 0) for rec in months.values())
 
-# ------------------------
-# before_request: allow preflight and ensure session exists
-# ------------------------
+
+def ensure_session_exists(session_name: str):
+    sname = sanitize_session_name(session_name)
+    if sessions_col().find_one({"name": sname}, {"_id": 1}):
+        return
+
+    sessions_col().insert_one({"name": sname, "created_at": datetime.utcnow()})
+    prev = get_previous_session_name(sname)
+    if not prev:
+        return
+
+    prev_students = list(students_col().find({"session": prev}).sort("id", ASCENDING))
+    for s in prev_students:
+        roll = str(s.get("roll", ""))
+        if students_col().find_one({"session": sname, "class_name": s.get("class_name"), "roll": roll}, {"_id": 1}):
+            continue
+        students_col().insert_one({
+            "session": sname,
+            "id": get_next_sequence(f"{sname}:student_id"),
+            "name": s.get("name"),
+            "father": s.get("father"),
+            "class_name": s.get("class_name"),
+            "roll": roll,
+            "previous_due": calc_carry_forward_amount(s),
+            "advance": 0,
+            "months": ensure_months_normalized(default_month_structure()),
+            "annual_charge": 0,
+            "scholarship": sanitize_discount_config(s.get("scholarship")),
+            "concession": sanitize_discount_config(s.get("concession")),
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        })
+
+
+def student_to_dict(d: Dict[str, Any]):
+    months = ensure_months_normalized(d.get("months") or {})
+    payment_methods = d.get("payment_methods") if isinstance(d.get("payment_methods"), dict) else {}
+    return {
+        "id": int(d.get("id", 0) or 0),
+        "name": d.get("name"),
+        "father": d.get("father"),
+        "class_name": d.get("class_name"),
+        "roll": str(d.get("roll", "")),
+        "previous_due": int(d.get("previous_due", 0) or 0),
+        "advance": int(d.get("advance", 0) or 0),
+        "months": months,
+        "annual_charge": int(d.get("annual_charge", months.get("Annual", {}).get("paid", 0)) or 0),
+        "last_payment_method": str(d.get("last_payment_method", "") or ""),
+        "payment_methods": {
+            "cash": int(payment_methods.get("cash", 0) or 0),
+            "upi": int(payment_methods.get("upi", 0) or 0),
+            "bank": int(payment_methods.get("bank", 0) or 0),
+        },
+        "scholarship": sanitize_discount_config(d.get("scholarship")),
+        "concession": sanitize_discount_config(d.get("concession")),
+    }
+
+
+def receipt_to_dict(d: Dict[str, Any]):
+    return {
+        "id": int(d.get("id", 0) or 0),
+        "name": d.get("name"),
+        "father": d.get("father"),
+        "payment_type": d.get("payment_type", ""),
+        "admission_no": d.get("admission_no", ""),
+        "new_admission": bool(d.get("new_admission", False)),
+        "admission_charge": int(d.get("admission_charge", 0) or 0),
+        "scholarship": sanitize_discount_config(d.get("scholarship")),
+        "concession": sanitize_discount_config(d.get("concession")),
+        "class_name": d.get("class_name"),
+        "roll": str(d.get("roll", "")),
+        "date": d.get("date"),
+        "total_paid": int(d.get("total_paid", 0) or 0),
+        "total_due": int(d.get("total_due", 0) or 0),
+        "advance": int(d.get("advance", 0) or 0),
+        "annual_charge": int(d.get("annual_charge", 0) or 0),
+        "receipt_number": d.get("receipt_number"),
+        "months": d.get("months") or {},
+    }
+
+
+def apply_payment_to_student_months_and_prev(months: Dict[str, Any], prev_due: int, payment: int):
+    months = ensure_months_normalized(months or {})
+    remaining = int(payment or 0)
+    pay_prev = min(remaining, int(prev_due or 0))
+    prev_due = int(prev_due or 0) - pay_prev
+    remaining -= pay_prev
+
+    for m in ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Annual"]:
+        if remaining <= 0:
+            break
+        rec = months.get(m) or {"paid": 0, "due": 0, "status": "Due"}
+        due_amt = int(rec.get("due", 0) or 0)
+        if due_amt <= 0:
+            continue
+        pay = min(remaining, due_amt)
+        rec["paid"] = int(rec.get("paid", 0) or 0) + pay
+        rec["due"] = due_amt - pay
+        rec["status"] = "Paid" if rec["due"] <= 0 else "Partial"
+        months[m] = rec
+        remaining -= pay
+    return months, prev_due, remaining
+
+
 @app.before_request
 def before_request_switch_db():
     if request.method == "OPTIONS":
@@ -376,237 +381,142 @@ def before_request_switch_db():
         return resp
 
     try:
-        sname = get_session_from_request()
-        ensure_session_db_exists(sname)
+        if db is None:
+            raise RuntimeError(MONGO_INIT_ERROR or "MongoDB is not initialized. Check MONGO_URI.")
+        ensure_indexes()
+        ensure_session_exists(get_session_from_request())
     except Exception as e:
-        tb = traceback.format_exc()
-        print("Session ensure error:\n", tb)
-        resp = make_response(jsonify({"success": False, "error": str(e)}), 500)
+        resp = make_response(jsonify({"success": False, "error": f"MongoDB connection failed: {str(e)}"}), 500)
         resp.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
         return resp
 
-def get_session_from_request():
-    s = request.headers.get("X-Session")
-    if not s:
-        s = request.args.get("session")
-    return s or CURRENT_SESSION
 
-# ------------------------
-# Create new session (auto)
-# ------------------------
+@app.route("/")
+def home():
+    return jsonify({"success": True, "message": "Backend running", "session": get_session_from_request(), "db": "mongodb"})
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "session": get_session_from_request(), "db": "mongodb"})
+
+
+@app.route("/debug/list_dbs")
+def debug_list_dbs():
+    sessions = [d.get("name") for d in sessions_col().find({}, {"name": 1, "_id": 0}) if d.get("name")]
+    return jsonify(sorted(sessions))
+
+
+@app.route("/session/list")
+def session_list():
+    sessions = set(d.get("name") for d in sessions_col().find({}, {"name": 1, "_id": 0}) if d.get("name"))
+    sessions.add(DEFAULT_SESSION)
+
+    def sort_key(val: str):
+        m = re.match(r"^(\d+)_", val or "")
+        return int(m.group(1)) if m else 0
+
+    return jsonify({"success": True, "sessions": sorted(sessions, key=sort_key)})
+
+
 @app.route("/session/create_auto", methods=["POST"])
 def create_auto_session():
     data = request.get_json() or {}
-    from_session = data.get("from_session")
-    extra_fee = int(data.get("extra_fee", 0))
+    from_session = sanitize_session_name(data.get("from_session"))
+    extra_fee = int(data.get("extra_fee", 0) or 0)
 
     if not from_session:
         return jsonify({"success": False, "message": "Missing from_session"}), 400
 
     try:
         s, e = from_session.split("_")
-        s = int(s) + 1
-        e = int(e) + 1
-        new_session = f"{s}_{str(e)[-2:]}"
+        new_session = f"{int(s) + 1}_{str(int(e) + 1)[-2:]}"
     except Exception:
         return jsonify({"success": False, "message": "Invalid session format"}), 400
 
-    ensure_session_db_exists(new_session)
-
-    if extra_fee != 0:
-        new_engine = get_engine_for_session(new_session)
-        with new_engine.begin() as conn:
-            conn.execute(text("UPDATE student SET previous_due = previous_due + :fee"), {"fee": extra_fee})
+    ensure_session_exists(new_session)
+    if extra_fee:
+        students_col().update_many({"session": new_session}, {"$inc": {"previous_due": extra_fee}, "$set": {"updated_at": datetime.utcnow()}})
 
     return jsonify({"success": True, "new_session": new_session})
-# ------------------------
-# Basic routes
-# ------------------------
-@app.route("/debug/list_dbs")
-def debug_list_dbs():
-    return jsonify(os.listdir(SESSIONS_DIR))
 
 
-@app.route("/")
-def home():
-    s = get_session_from_request()
-    return jsonify({"success": True, "message": "Backend running", "session": s})
-
-@app.route("/health")
-def health():
-    s = get_session_from_request()
-    return jsonify({"status": "ok", "session": s})
-
-# ------------------------
-# STUDENT endpoints
-# ------------------------
-def upload_session_db_to_drive(session_name):
-    # Always use the same helper used everywhere else
-    db_file = session_db_path(session_name)
-
-    if not os.path.exists(db_file):
-        return {
-            "success": False,
-            "message": f"Database file not found for session {session_name}: {db_file}"
-        }
-
+@app.route("/delete_session", methods=["POST"])
+def delete_session():
     try:
-        service = get_drive_service()
-
-        file_metadata = {
-            "name": f"{session_name}_backup.db",
-            "mimeType": "application/octet-stream"
-        }
-
-        media = MediaFileUpload(db_file, resumable=True)
-
-        uploaded = service.files().create(
-            body=file_metadata,
-            media_body=media,
-            fields="id"
-        ).execute()
-
-        return {
-            "success": True,
-            "message": f"Backup uploaded successfully for session {session_name}",
-            "file_id": uploaded.get("id")
-        }
-
+        sname = sanitize_session_name(request.headers.get("X-Session"))
+        students_col().delete_many({"session": sname})
+        receipts_col().delete_many({"session": sname})
+        fees_col().delete_many({"session": sname})
+        sessions_col().delete_one({"name": sname})
+        counters_col().delete_many({"_id": {"$regex": f"^{re.escape(sname)}:"}})
+        return jsonify({"success": True, "message": "Session deleted successfully"})
     except Exception as e:
-        return {"success": False, "message": str(e)}
-
-@app.route("/backup/save_all_to_drive", methods=["POST"])
-def backup_all_sessions_to_drive():
-    try:
-        files = []
-
-        # Loop through session directory
-        for file in os.listdir(SESSIONS_DIR):
-            if file.endswith(".db"):
-                session_name = file.replace("school_", "").replace(".db", "")
-                
-                result = upload_session_db_to_drive(session_name)
-
-                files.append({
-                    "session": session_name,
-                    "success": result.get("success"),
-                    "message": result.get("message"),
-                    "file_id": result.get("file_id")
-                })
-
-        return jsonify({
-            "success": True,
-            "message": "All backups completed",
-            "files": files
-        })
-
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "message": str(e)
-        }), 500
+        return jsonify({"success": False, "message": str(e)}), 500
 
 
 @app.route("/student/add", methods=["POST"])
 def add_student():
-    data = request.get_json()
-    if not data:
-        return jsonify({"success": False, "message": "No JSON provided"}), 400
-
+    data = request.get_json() or {}
     name = data.get("name")
     cls = data.get("class_name")
     roll = str(data.get("roll")) if data.get("roll") is not None else None
-
     if not name or not cls or roll is None:
         return jsonify({"success": False, "message": "Missing name/class/roll"}), 400
 
     sname = get_session_from_request()
+    months = ensure_months_normalized(data.get("months", {}))
+    if students_col().find_one({"session": sname, "class_name": cls, "roll": roll}, {"_id": 1}):
+        return jsonify({"success": False, "message": "Student exists"}), 200
 
-    if sname == DEFAULT_SESSION:
-        with app.app_context():
-            if Student.query.filter_by(class_name=cls, roll=roll).first():
-                return jsonify({"success": False, "message": "Student exists"}), 200
-            months = ensure_months_normalized(ensure_months_has_annual(data.get("months", {})))
-            student = Student(
-                name=name,
-                father=data.get("father"),
-                class_name=cls,
-                roll=roll,
-                previous_due=int(data.get("previous_due", 0) or 0),
-                advance=int(data.get("advance", 0) or 0),
-                months=months
-            )
-            db.session.add(student)
-            db.session.commit()
-            return jsonify({"success": True, "student": student.to_dict()})
-    else:
-        engine = get_engine_for_session(sname)
-        if engine is None:
-            return jsonify({"success": False, "message": "Session engine missing"}), 500
+    doc = {
+        "session": sname,
+        "id": get_next_sequence(f"{sname}:student_id"),
+        "name": name,
+        "father": data.get("father"),
+        "class_name": cls,
+        "roll": roll,
+        "previous_due": int(data.get("previous_due", 0) or 0),
+        "advance": int(data.get("advance", 0) or 0),
+        "months": months,
+        "last_payment_method": str(data.get("last_payment_method", "") or ""),
+        "payment_methods": {
+            "cash": int(((data.get("payment_methods") or {}).get("cash", 0)) or 0),
+            "upi": int(((data.get("payment_methods") or {}).get("upi", 0)) or 0),
+            "bank": int(((data.get("payment_methods") or {}).get("bank", 0)) or 0),
+        },
+        "annual_charge": int(months.get("Annual", {}).get("paid", 0) or 0),
+        "scholarship": sanitize_discount_config(data.get("scholarship")),
+        "concession": sanitize_discount_config(data.get("concession")),
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
+    }
+    try:
+        students_col().insert_one(doc)
+    except DuplicateKeyError:
+        return jsonify({"success": False, "message": "Student exists"}), 200
 
-        months_struct = ensure_months_normalized(ensure_months_has_annual(data.get("months", {})))
-        months_json = json.dumps(months_struct)
-        with engine.begin() as conn:
-            existing = conn.execute(text("SELECT id FROM student WHERE class_name=:cls AND roll=:roll"), {"cls": cls, "roll": roll}).fetchone()
-            if existing:
-                return jsonify({"success": False, "message": "Student exists"}), 200
-            res = conn.execute(text(
-                "INSERT INTO student (name, father, class_name, roll, previous_due, advance, months, annual_charge) "
-                "VALUES (:name, :father, :class_name, :roll, :previous_due, :advance, :months, :annual_charge)"
-            ), {
-                "name": name,
-                "father": data.get("father"),
-                "class_name": cls,
-                "roll": roll,
-                "previous_due": int(data.get("previous_due", 0) or 0),
-                "advance": int(data.get("advance", 0) or 0),
-                "months": months_json,
-                "annual_charge": int((data.get("months") or {}).get("Annual", {}).get("paid", 0) or 0)
-            })
-            lastid = None
-            try:
-                lastid = res.lastrowid
-            except Exception:
-                pass
-            return jsonify({"success": True, "student": {"id": lastid, "name": name, "class_name": cls, "roll": roll}})
+    return jsonify({"success": True, "student": student_to_dict(doc)})
+
 
 @app.route("/students")
 def get_students():
     sname = get_session_from_request()
-    if sname == DEFAULT_SESSION:
-        with app.app_context():
-            students = Student.query.all()
-            return jsonify({"success": True, "students": [s.to_dict() for s in students]})
-    else:
-        engine = get_engine_for_session(sname)
-        if engine is None:
-            return jsonify({"success": False, "message": "Session engine missing"}), 500
+    class_name = (request.args.get("class_name") or request.args.get("class") or "").strip()
+    q = {"session": sname}
+    if class_name:
+        q["class_name"] = class_name
+    docs = students_col().find(q, {"_id": 0}).sort([("class_name", ASCENDING), ("roll", ASCENDING)])
+    return jsonify({"success": True, "students": [student_to_dict(d) for d in docs]})
 
-        with engine.connect() as conn:
-            res = conn.execute(text("SELECT id, name, father, class_name, roll, previous_due, advance, months, annual_charge FROM student"))
-            rows = [row_to_student_dict(r._mapping) for r in res.fetchall()]
-            return jsonify({"success": True, "students": rows})
 
 @app.route("/student/<class_name>/<roll>")
 def get_single_student(class_name, roll):
     sname = get_session_from_request()
-    if sname == DEFAULT_SESSION:
-        with app.app_context():
-            student = Student.query.filter_by(class_name=class_name, roll=roll).first()
-            if not student:
-                return jsonify({"success": False, "message": "Not found"}), 404
-            return jsonify({"success": True, "student": student.to_dict()})
-    else:
-        engine = get_engine_for_session(sname)
-        with engine.connect() as conn:
-            res = conn.execute(text(
-                "SELECT id, name, father, class_name, roll, previous_due, advance, months, annual_charge FROM student "
-                "WHERE class_name=:cls AND roll=:roll"
-            ), {"cls": class_name, "roll": roll})
-            row = res.fetchone()
-            if not row:
-                return jsonify({"success": False, "message": "Not found"}), 404
-            return jsonify({"success": True, "student": row_to_student_dict(row._mapping)})
+    doc = students_col().find_one({"session": sname, "class_name": class_name, "roll": str(roll)}, {"_id": 0})
+    if not doc:
+        return jsonify({"success": False, "message": "Not found"}), 404
+    return jsonify({"success": True, "student": student_to_dict(doc)})
 
 @app.route("/update_student", methods=["POST", "OPTIONS"])
 def update_student():
@@ -615,175 +525,81 @@ def update_student():
 
     data = request.json or {}
     class_name = data.get("class")
-    roll = data.get("roll")
+    roll = str(data.get("roll")) if data.get("roll") is not None else None
     if not class_name or roll is None:
         return jsonify({"success": False, "message": "Missing class or roll"}), 400
 
     sname = get_session_from_request()
     sdata = data.get("student", {})
+    student = students_col().find_one({"session": sname, "class_name": class_name, "roll": roll})
+    if not student:
+        return jsonify({"success": False, "message": "Student not found"}), 404
 
-    if sname == DEFAULT_SESSION:
-        with app.app_context():
-            student = Student.query.filter_by(class_name=class_name, roll=roll).first()
-            if not student:
-                return jsonify({"success": False, "message": "Student not found"}), 404
-            student.name = sdata.get("name", student.name)
-            student.father = sdata.get("father", student.father)
-            student.previous_due = int(sdata.get("previous_due", student.previous_due) or 0)
-            student.advance = int(sdata.get("advance", student.advance) or 0)
-            months = ensure_months_normalized(ensure_months_has_annual(sdata.get("months", student.months)))
-            student.months = months
-            try:
-                student.annual_charge = int(months.get("Annual", {}).get("paid", 0) or 0)
-            except Exception:
-                pass
-            student.class_name = sdata.get("class_name", student.class_name)
-            student.roll = sdata.get("roll", student.roll)
-            db.session.commit()
-            return jsonify({"success": True, "message": "Updated"})
-    else:
-        engine = get_engine_for_session(sname)
-        months_struct = ensure_months_normalized(ensure_months_has_annual(sdata.get("months", {})))
-        months_json = json.dumps(months_struct)
-        with engine.begin() as conn:
-            conn.execute(text(
-                "UPDATE student SET name=:name, father=:father, previous_due=:prev, advance=:adv, months=:months, annual_charge=:annual_charge, class_name=:cls, roll=:roll "
-                "WHERE class_name=:wcls AND roll=:wroll"
-            ), {
-                "name": sdata.get("name", sdata.get("name")),
-                "father": sdata.get("father", sdata.get("father")),
-                "prev": int(sdata.get("previous_due", 0) or 0),
-                "adv": int(sdata.get("advance", 0) or 0),
-                "months": months_json,
-                "annual_charge": int(months_struct.get("Annual", {}).get("paid", 0) or 0),
-                "cls": sdata.get("class_name", class_name),
-                "roll": sdata.get("roll", roll),
-                "wcls": class_name,
-                "wroll": roll
-            })
-            return jsonify({"success": True, "message": "Updated"})
+    months = ensure_months_normalized(sdata.get("months", student.get("months", {})))
+    pm_in = sdata.get("payment_methods", student.get("payment_methods", {}))
+    if not isinstance(pm_in, dict):
+        pm_in = {}
+    payment_methods = {
+        "cash": int(pm_in.get("cash", ((student.get("payment_methods") or {}).get("cash", 0)) or 0)),
+        "upi": int(pm_in.get("upi", ((student.get("payment_methods") or {}).get("upi", 0)) or 0)),
+        "bank": int(pm_in.get("bank", ((student.get("payment_methods") or {}).get("bank", 0)) or 0)),
+    }
+    new_class = sdata.get("class_name", student.get("class_name"))
+    new_roll = str(sdata.get("roll", student.get("roll")))
+
+    if (new_class != class_name or new_roll != roll) and students_col().find_one({"session": sname, "class_name": new_class, "roll": new_roll, "id": {"$ne": student.get("id")}}, {"_id": 1}):
+        return jsonify({"success": False, "message": "Student exists with new class/roll"}), 409
+
+    students_col().update_one(
+        {"session": sname, "id": student.get("id")},
+        {
+            "$set": {
+                "name": sdata.get("name", student.get("name")),
+                "father": sdata.get("father", student.get("father")),
+                "previous_due": int(sdata.get("previous_due", student.get("previous_due", 0)) or 0),
+                "advance": int(sdata.get("advance", student.get("advance", 0)) or 0),
+                "months": months,
+                "last_payment_method": str(sdata.get("last_payment_method", student.get("last_payment_method", "")) or ""),
+                "payment_methods": payment_methods,
+                "annual_charge": int(months.get("Annual", {}).get("paid", 0) or 0),
+                "scholarship": sanitize_discount_config(sdata.get("scholarship", student.get("scholarship"))),
+                "concession": sanitize_discount_config(sdata.get("concession", student.get("concession"))),
+                "class_name": new_class,
+                "roll": new_roll,
+                "updated_at": datetime.utcnow(),
+            }
+        },
+    )
+    return jsonify({"success": True, "message": "Updated"})
+
 
 @app.route("/student/delete", methods=["POST"])
 def delete_student():
     data = request.json or {}
     cls = data.get("class")
-    roll = data.get("roll")
+    roll = str(data.get("roll")) if data.get("roll") is not None else None
     if not cls or roll is None:
         return jsonify({"success": False, "message": "Missing class or roll"}), 400
 
     sname = get_session_from_request()
-    if sname == DEFAULT_SESSION:
-        with app.app_context():
-            student = Student.query.filter_by(class_name=cls, roll=roll).first()
-            if not student:
-                return jsonify({"success": False, "message": "Not found"}), 404
-            Receipt.query.filter_by(student_id=student.id).delete()
-            db.session.delete(student)
-            db.session.commit()
-            return jsonify({"success": True, "message": "Deleted"})
-    else:
-        engine = get_engine_for_session(sname)
-        with engine.begin() as conn:
-            conn.execute(text("DELETE FROM receipt WHERE class_name=:cls AND roll=:roll"), {"cls": cls, "roll": roll})
-            conn.execute(text("DELETE FROM student WHERE class_name=:cls AND roll=:roll"), {"cls": cls, "roll": roll})
-            return jsonify({"success": True, "message": "Deleted"})
-        
-@app.route("/delete_session", methods=["POST"])
-def delete_session():
-    try:
-        session_name = request.headers.get("X-Session")
-        if not session_name:
-            return jsonify({"success": False, "message": "Session name missing"})
+    if not students_col().find_one({"session": sname, "class_name": cls, "roll": roll}, {"_id": 1}):
+        return jsonify({"success": False, "message": "Not found"}), 404
 
-        db_path = os.path.join(SESSIONS_DIR, f"school_{session_name}.db")
+    receipts_col().delete_many({"session": sname, "class_name": cls, "roll": roll})
+    students_col().delete_one({"session": sname, "class_name": cls, "roll": roll})
+    return jsonify({"success": True, "message": "Deleted"})
 
-        if not os.path.exists(db_path):
-            return jsonify({"success": False, "message": "Session not found"})
-
-        # Dispose SQLAlchemy engine if exists
-        engine = ENGINES.get(session_name)
-        if engine:
-            try:
-                engine.dispose()
-            except:
-                pass
-            ENGINES.pop(session_name, None)
-            SESSIONMAKERS.pop(session_name, None)
-
-        # Force SQLite unlock  
-        try:
-            conn = sqlite3.connect(db_path)
-            conn.execute("PRAGMA journal_mode=DELETE;")
-            conn.close()
-        except:
-            pass
-
-        # Try deleting (Windows fix)
-        try:
-            os.remove(db_path)
-        except PermissionError:
-            time.sleep(0.3)
-            os.remove(db_path)
-
-        return jsonify({"success": True, "message": "Session deleted successfully"})
-
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)})
-
-# ------------------------
-# RECEIPTS endpoints (with payment application logic)
-# ------------------------
-def apply_payment_to_student_months_and_prev(months: Dict[str, Any], prev_due: int, payment: int):
-    """
-    Option A: apply payment to previous_due first, then to months (Jan..Dec then Annual).
-    Returns (new_months_dict, new_prev_due, unpaid_left)
-    """
-    months = months or {}
-    months = ensure_months_normalized(months)
-    remaining = int(payment or 0)
-
-    # 1) pay previous due
-    pay_prev = min(remaining, int(prev_due or 0))
-    prev_due = int(prev_due or 0) - pay_prev
-    remaining -= pay_prev
-
-    # 2) apply to months in calendar order (Jan..Dec then Annual)
-    order = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec","Annual"]
-    for m in order:
-        if remaining <= 0:
-            break
-        rec = months.get(m) or {"paid":0,"due":0,"status":"Due"}
-        due_amt = int(rec.get("due", 0) or 0)
-        if due_amt <= 0:
-            continue
-        to_pay = min(remaining, due_amt)
-        rec["paid"] = int(rec.get("paid", 0) or 0) + to_pay
-        rec["due"] = due_amt - to_pay
-        if rec["due"] <= 0:
-            rec["status"] = "Paid"
-            rec["due"] = 0
-        else:
-            rec["status"] = "Partial"
-        months[m] = rec
-        remaining -= to_pay
-
-    return months, prev_due, remaining
 
 @app.route("/receipt/add", methods=["POST"])
 def add_receipt():
     try:
         data = request.json or {}
-
-        # Required fields
-        required = ["name", "father", "class", "roll", "date",
-                    "totalPaid", "totalDue", "advance", "months", "receiptKey"]
+        required = ["name", "father", "class", "roll", "date", "totalPaid", "totalDue", "advance", "months", "receiptKey"]
         for key in required:
             if key not in data:
                 return jsonify({"success": False, "message": f"Missing {key}"}), 400
 
         sname = get_session_from_request()
-
-        # Normalize months
         months_raw = data.get("months", {})
         months = {}
 
@@ -793,343 +609,296 @@ def add_receipt():
                 if not key:
                     continue
                 months[key] = {
-                    "paid": int(item.get("paid", 0)),
-                    "due": int(item.get("due", 0)),
+                    "paid": int(item.get("paid", 0) or 0),
+                    "due": int(item.get("due", 0) or 0),
                     "status": item.get("status", ""),
                     "purpose": item.get("purpose", ""),
-                    "extra": int(item.get("extra", 0)),
-                    "date": item.get("date", "")
+                    "extra": int(item.get("extra", 0) or 0),
+                    "date": item.get("date", ""),
+                    "exam_fee_applied": int(item.get("exam_fee_applied", 0) or 0),
                 }
         elif isinstance(months_raw, dict):
             for k, v in months_raw.items():
-                if not isinstance(v, dict):
-                    months[k] = {"paid": 0, "due": 0, "status": "", "purpose": "",
-                                 "extra": 0, "date": ""}
-                else:
-                    months[k] = {
-                        "paid": int(v.get("paid", 0)),
-                        "due": int(v.get("due", 0)),
-                        "status": v.get("status", ""),
-                        "purpose": v.get("purpose", ""),
-                        "extra": int(v.get("extra", 0)),
-                        "date": v.get("date", "")
-                    }
+                vv = v if isinstance(v, dict) else {}
+                months[k] = {
+                    "paid": int(vv.get("paid", 0) or 0),
+                    "due": int(vv.get("due", 0) or 0),
+                    "status": vv.get("status", ""),
+                    "purpose": vv.get("purpose", ""),
+                    "extra": int(vv.get("extra", 0) or 0),
+                    "date": vv.get("date", ""),
+                    "exam_fee_applied": int(vv.get("exam_fee_applied", 0) or 0),
+                }
 
-        months_json = json.dumps(months)
-        annual_paid = int(months.get("Annual", {}).get("paid", 0))
+        old = receipts_col().find_one({"session": sname, "receipt_key": data["receiptKey"]}, {"_id": 0, "receipt_number": 1})
+        if old:
+            return jsonify({"success": True, "message": "Duplicate ignored", "receipt_number": old.get("receipt_number")})
 
-        # =====================
-        # DEFAULT SESSION → ORM
-        # =====================
-        if sname == DEFAULT_SESSION:
-            with app.app_context():
-                existing = Receipt.query.filter_by(receipt_key=data["receiptKey"]).first()
-                if existing:
-                    return jsonify({
-                        "success": True,
-                        "message": "Duplicate ignored",
-                        "receipt_number": existing.receipt_number
-                    })
+        rid = get_next_sequence(f"{sname}:receipt_id")
+        receipt_number = f"{sname}-{data['class']}-{data['roll']}-{rid:06d}"
+        annual_paid = int(months.get("Annual", {}).get("paid", 0) or 0)
 
-                # Create receipt without receipt_number first
-                r = Receipt(
-                    student_id=None,
-                    name=data["name"],
-                    father=data["father"],
-                    class_name=data["class"],
-                    roll=str(data["roll"]),
-                    date=data["date"],
-                    total_paid=int(data["totalPaid"]),
-                    total_due=int(data["totalDue"]),
-                    advance=int(data["advance"]),
-                    months_json=months_json,
-                    receipt_key=data["receiptKey"],
-                    annual_charge=annual_paid
-                )
-                db.session.add(r)
-                db.session.flush()  # Assigns r.id from DB
-                r.receipt_number = f"{sname}-{data['class']}-{data['roll']}-{r.id:06d}"
-                db.session.commit()
+        receipts_col().insert_one({
+            "session": sname,
+            "id": rid,
+            "student_id": None,
+            "name": data["name"],
+            "father": data["father"],
+            "payment_type": str(data.get("paid_type", data.get("payment_type", "")) or "").lower(),
+            "admission_no": str(data.get("admission_no", "") or ""),
+            "new_admission": bool(data.get("new_admission", False)),
+            "admission_charge": int(data.get("admission_charge", 0) or 0),
+            "scholarship": sanitize_discount_config(data.get("scholarship")),
+            "concession": sanitize_discount_config(data.get("concession")),
+            "class_name": data["class"],
+            "roll": str(data["roll"]),
+            "date": data["date"],
+            "total_paid": int(data["totalPaid"]),
+            "total_due": int(data["totalDue"]),
+            "advance": int(data["advance"]),
+            "months": months,
+            "receipt_key": data["receiptKey"],
+            "annual_charge": annual_paid,
+            "receipt_number": receipt_number,
+            "created_at": datetime.utcnow(),
+        })
 
-                # Update student monthly dues
-                student = Student.query.filter_by(
-                    class_name=data["class"],
-                    roll=str(data["roll"])
-                ).first()
-                if student:
-                    current_months = ensure_months_normalized(student.months or {})
-                    prev_due = int(student.previous_due or 0)
-                    payment = int(data["totalPaid"])
+        # Do not re-apply payment to student ledger here.
+        # Student months are already updated in student_details page (submit/mark paid).
+        # Re-applying on receipt save causes duplicate month payments after generating receipt.
 
-                    new_months, new_prev_due, _ = apply_payment_to_student_months_and_prev(
-                        current_months, prev_due, payment
-                    )
-
-                    student.months = new_months
-                    student.previous_due = new_prev_due
-                    student.annual_charge = int(new_months.get("Annual", {}).get("paid", 0))
-                    db.session.commit()
-
-                return jsonify({
-                    "success": True,
-                    "message": "Receipt saved",
-                    "receipt_number": r.receipt_number
-                })
-
-        # =====================
-        # NON-DEFAULT SESSION → RAW SQL
-        # =====================
-        else:
-            engine = get_engine_for_session(sname)
-            if not engine:
-                return jsonify({"success": False, "message": "Session engine missing"}), 500
-
-            with engine.begin() as conn:
-                # Duplicate check
-                chk = conn.execute(text(
-                    "SELECT receipt_number FROM receipt WHERE receipt_key=:rk"
-                ), {"rk": data["receiptKey"]}).fetchone()
-
-                if chk:
-                    return jsonify({
-                        "success": True,
-                        "message": "Duplicate ignored",
-                        "receipt_number": chk[0]
-                    })
-
-                # Insert without receipt_number first, get inserted id
-                res = conn.execute(text("""
-                    INSERT INTO receipt
-                    (student_id, name, father, class_name, roll, date,
-                     total_paid, total_due, advance, months_json,
-                     receipt_key, annual_charge)
-                    VALUES
-                    (:sid, :name, :father, :cls, :roll, :date,
-                     :paid, :due, :adv, :months,
-                     :rk, :annual)
-                    RETURNING id
-                """), {
-                    "sid": None,
-                    "name": data["name"],
-                    "father": data["father"],
-                    "cls": data["class"],
-                    "roll": str(data["roll"]),
-                    "date": data["date"],
-                    "paid": int(data["totalPaid"]),
-                    "due": int(data["totalDue"]),
-                    "adv": int(data["advance"]),
-                    "months": months_json,
-                    "rk": data["receiptKey"],
-                    "annual": annual_paid
-                })
-
-                rid = res.fetchone()[0]
-                receipt_number = f"{sname}-{data['class']}-{data['roll']}-{rid:06d}"
-
-                # Update receipt_number
-                conn.execute(text("""
-                    UPDATE receipt SET receipt_number=:rno WHERE id=:rid
-                """), {"rno": receipt_number, "rid": rid})
-
-                # Update student
-                st_row = conn.execute(text("""
-                    SELECT id, previous_due, months 
-                    FROM student 
-                    WHERE class_name=:cls AND roll=:roll
-                """), {"cls": data["class"], "roll": str(data["roll"])}).fetchone()
-
-                if st_row:
-                    m = st_row._mapping
-                    prev = int(m["previous_due"] or 0)
-                    try:
-                        cur_months = json.loads(m["months"])
-                    except:
-                        cur_months = {}
-
-                    paid = int(data["totalPaid"])
-                    new_months, new_prev, _ = apply_payment_to_student_months_and_prev(
-                        cur_months, prev, paid
-                    )
-
-                    conn.execute(text("""
-                        UPDATE student 
-                        SET previous_due=:pd, months=:m, annual_charge=:ac 
-                        WHERE id=:id
-                    """), {
-                        "pd": new_prev,
-                        "m": json.dumps(new_months),
-                        "ac": int(new_months.get("Annual", {}).get("paid", 0)),
-                        "id": m["id"]
-                    })
-
-                return jsonify({
-                    "success": True,
-                    "message": "Receipt saved",
-                    "receipt_number": receipt_number
-                })
-
+        return jsonify({"success": True, "message": "Receipt saved", "receipt_number": receipt_number})
     except Exception as e:
         print(traceback.format_exc())
         return jsonify({"success": False, "message": str(e)}), 500
 
+
 @app.route("/receipt/history")
 def receipt_history():
     sname = get_session_from_request()
+    # Backward-compatible behavior:
+    # - If page/page_size are provided, return paginated history.
+    # - Otherwise return full history (old behavior).
+    page_arg = request.args.get("page")
+    size_arg = request.args.get("page_size")
 
-    # ============================================
-    # DEFAULT SESSION → ORM
-    # ============================================
-    if sname == DEFAULT_SESSION:
-        with app.app_context():
-            records = Receipt.query.order_by(Receipt.id.desc()).all()
-            return jsonify({
-                "success": True,
-                "history": [
-                    {
-                        "id": r.id,
-                        "name": r.name,
-                        "father": r.father,
-                        "class_name": r.class_name,
-                        "roll": r.roll,
-                        "date": r.date,
-                        "total_paid": r.total_paid,
-                        "total_due": r.total_due,
-                        "advance": r.advance,
-                        "annual_charge": r.annual_charge,
-                        "receipt_number": r.receipt_number,
-                        "months": json.loads(r.months_json) if r.months_json else {},
-                    }
-                    for r in records
-                ]
-            })
-
-    # ============================================
-    # NON-DEFAULT SESSION → RAW SQL
-    # ============================================
-    else:
-        engine = get_engine_for_session(sname)
-        if not engine:
-            return jsonify({"success": False, "message": "Session engine missing"}), 500
-
-        with engine.connect() as conn:
-            res = conn.execute(text("""
-                SELECT id, name, father, class_name, roll, date,
-                       total_paid, total_due, advance,
-                       months_json, annual_charge, receipt_number
-                FROM receipt
-                ORDER BY id DESC
-            """))
-
-            result = res.fetchall()
-
-            # 🔥 FIX: use _mapping for safe dict conversion
-            rows = [dict(r._mapping) for r in result]
-
-            return jsonify({
-                "success": True,
-                "history": [
-                    {
-                        "id": row["id"],
-                        "name": row["name"],
-                        "father": row["father"],
-                        "class_name": row["class_name"],
-                        "roll": row["roll"],
-                        "date": row["date"],
-                        "total_paid": row["total_paid"],
-                        "total_due": row["total_due"],
-                        "advance": row["advance"],
-                        "annual_charge": row.get("annual_charge", 0),
-                        "receipt_number": row.get("receipt_number"),
-                        "months": json.loads(row["months_json"]) if row["months_json"] else {},
-                    }
-                    for row in rows
-                ]
-            })
-# ------------------------
-@app.route("/fees/get")
-def fees_get():
-    session = request.headers.get("X-Session", DEFAULT_SESSION)
-    db_path = os.path.join(SESSIONS_DIR, f"school_{session}.db")
-
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS fee_structure (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            class_name TEXT UNIQUE,
-            monthly_fee INTEGER DEFAULT 0,
-            annual_charge INTEGER DEFAULT 0
-        )
-    """)
+    if page_arg is None and size_arg is None:
+        docs = receipts_col().find({"session": sname}, {"_id": 0}).sort("id", DESCENDING)
+        return jsonify({"success": True, "history": [receipt_to_dict(d) for d in docs]})
 
     try:
-        cur.execute("ALTER TABLE fee_structure ADD COLUMN annual_charge INTEGER DEFAULT 0")
-    except:
-        pass
+        page = max(1, int(page_arg or 1))
+    except Exception:
+        page = 1
+    try:
+        page_size = int(size_arg or 50)
+    except Exception:
+        page_size = 50
+    page_size = min(max(page_size, 1), 200)
 
-    default_classes = [
-        "Nursery", "LKG", "UKG",
-        "1st", "2nd", "3rd", "4th", "5th",
-        "6th", "7th", "8th",
-        "9th", "10th",
-        "11th Arts", "12th Arts"
-    ]
+    q = {"session": sname}
+    total = receipts_col().count_documents(q)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    if page > total_pages:
+        page = total_pages
 
-    cur.execute("SELECT class_name FROM fee_structure")
-    existing = {row["class_name"] for row in cur.fetchall()}
+    skip = (page - 1) * page_size
+    docs = (
+        receipts_col()
+        .find(q, {"_id": 0})
+        .sort("id", DESCENDING)
+        .skip(skip)
+        .limit(page_size)
+    )
+    return jsonify({
+        "success": True,
+        "history": [receipt_to_dict(d) for d in docs],
+        "page": page,
+        "page_size": page_size,
+        "total": int(total),
+        "total_pages": int(total_pages),
+    })
 
-    for cls in default_classes:
-        if cls not in existing:
-            cur.execute(
-                "INSERT INTO fee_structure (class_name, monthly_fee, annual_charge) VALUES (?, ?, ?)",
-                (cls, 0, 0)
-            )
 
-    conn.commit()
-    cur.execute("SELECT * FROM fee_structure ORDER BY id")
-    rows = cur.fetchall()
-    conn.close()
+@app.route("/receipt/delete/<int:id>", methods=["DELETE"])
+def delete_receipt(id):
+    try:
+        sname = get_session_from_request()
+        deleted = receipts_col().delete_one({"session": sname, "id": int(id)}).deleted_count
+        if not deleted:
+            return jsonify({"success": False, "message": "Receipt not found"}), 404
+        return jsonify({"success": True, "message": "Receipt deleted"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
 
-    return jsonify({"success": True, "fees": [dict(r) for r in rows]})
+
+@app.route("/receipt/delete_all", methods=["DELETE"])
+def delete_all_receipts():
+    try:
+        receipts_col().delete_many({"session": get_session_from_request()})
+        return jsonify({"success": True, "message": "All deleted"})
+    except Exception as e:
+        return jsonify({"success": False, "message": str(e)}), 500
+
+@app.route("/fees/get")
+def fees_get():
+    sname = get_session_from_request()
+    existing = list(fees_col().find({"session": sname}, {"_id": 0}))
+    existing_classes = {normalize_class_name(d.get("class_name")) for d in existing if normalize_class_name(d.get("class_name"))}
+    missing = [c for c in DEFAULT_CLASSES if c not in existing_classes]
+
+    if missing:
+        fees_col().insert_many([
+            {
+                "session": sname,
+                "class_name": c,
+                "monthly_fee": 0,
+                "annual_charge": 0,
+                "admission_charge": 0,
+                "exam_charge": 0,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            }
+            for c in missing
+        ])
+
+    # Backfill old records that used "admission_fee" or had no admission field.
+    # This keeps old DB data consistent with the current API.
+    old_rows = list(
+        fees_col().find(
+            {"session": sname, "admission_charge": {"$exists": False}},
+            {"_id": 1, "admission_fee": 1},
+        )
+    )
+    for row in old_rows:
+        mapped = to_int(row.get("admission_fee", 0), 0)
+        fees_col().update_one(
+            {"_id": row["_id"]},
+            {"$set": {"admission_charge": mapped, "admission_fee": mapped, "updated_at": datetime.utcnow()}},
+        )
+
+    old_exam_rows = list(
+        fees_col().find(
+            {"session": sname, "exam_charge": {"$exists": False}},
+            {"_id": 1, "exam_fee": 1},
+        )
+    )
+    for row in old_exam_rows:
+        mapped = to_int(row.get("exam_fee", 0), 0)
+        fees_col().update_one(
+            {"_id": row["_id"]},
+            {"$set": {"exam_charge": mapped, "exam_fee": mapped, "updated_at": datetime.utcnow()}},
+        )
+
+    docs = list(fees_col().find({"session": sname}, {"_id": 0}))
+    merged_by_class: Dict[str, Dict[str, Any]] = {}
+    for d in docs:
+        cls = normalize_class_name(d.get("class_name"))
+        if not cls:
+            continue
+        current = merged_by_class.get(cls)
+        if current is None:
+            merged_by_class[cls] = d
+            continue
+
+        cur_time = current.get("updated_at") or current.get("created_at") or datetime.min
+        new_time = d.get("updated_at") or d.get("created_at") or datetime.min
+        if new_time >= cur_time:
+            merged_by_class[cls] = d
+
+    normalized_docs = list(merged_by_class.values())
+    normalized_docs.sort(key=lambda d: (DEFAULT_CLASSES.index(normalize_class_name(d.get("class_name"))) if normalize_class_name(d.get("class_name")) in DEFAULT_CLASSES else 999, normalize_class_name(d.get("class_name"))))
+    fees = []
+    for i, d in enumerate(normalized_docs):
+        fees.append({
+            "id": i + 1,
+            "class_name": normalize_class_name(d.get("class_name")),
+            "monthly_fee": to_int(d.get("monthly_fee", 0), 0),
+            "annual_charge": to_int(d.get("annual_charge", 0), 0),
+            "admission_charge": to_int(d.get("admission_charge", d.get("admission_fee", 0)), 0),
+            "exam_charge": to_int(d.get("exam_charge", d.get("exam_fee", 0)), 0),
+        })
+    return jsonify({"success": True, "fees": fees})
+
 
 @app.route("/fees/update", methods=["POST"])
 def update_fee():
     data = request.json or {}
-    cls = data.get("class_name")
-    monthly = int(data.get("monthly_fee", 0))
-    annual = int(data.get("annual_charge", 0))
-
+    cls = normalize_class_name(data.get("class_name"))
     if not cls:
         return jsonify({"success": False, "message": "Missing class_name"}), 400
 
+    admission_value = data.get("admission_charge", data.get("admission_fee", 0))
+    exam_value = data.get("exam_charge", data.get("exam_fee", 0))
     sname = get_session_from_request()
-    db_path = os.path.join(SESSIONS_DIR, f"school_{sname}.db")
-
-    conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-
-    try:
-        cur.execute("ALTER TABLE fee_structure ADD COLUMN annual_charge INTEGER DEFAULT 0")
-    except:
-        pass
-
-    cur.execute(
-        "UPDATE fee_structure SET monthly_fee=?, annual_charge=? WHERE class_name=?",
-        (monthly, annual, cls)
+    fees_col().update_one(
+        {"session": sname, "class_name": cls},
+        {
+            "$set": {
+                "monthly_fee": to_int(data.get("monthly_fee", 0), 0),
+                "annual_charge": to_int(data.get("annual_charge", 0), 0),
+                "admission_charge": to_int(admission_value, 0),
+                "admission_fee": to_int(admission_value, 0),
+                "exam_charge": to_int(exam_value, 0),
+                "exam_fee": to_int(exam_value, 0),
+                "updated_at": datetime.utcnow(),
+            },
+            "$setOnInsert": {"created_at": datetime.utcnow()},
+        },
+        upsert=True,
     )
+    saved = fees_col().find_one({"session": sname, "class_name": cls}, {"_id": 0})
+    return jsonify({
+        "success": True,
+        "message": "Updated",
+        "fee": {
+            "class_name": cls,
+            "monthly_fee": to_int((saved or {}).get("monthly_fee", 0), 0),
+            "annual_charge": to_int((saved or {}).get("annual_charge", 0), 0),
+            "admission_charge": to_int((saved or {}).get("admission_charge", (saved or {}).get("admission_fee", 0)), 0),
+            "exam_charge": to_int((saved or {}).get("exam_charge", (saved or {}).get("exam_fee", 0)), 0),
+        },
+    })
 
-    if cur.rowcount == 0:
-        cur.execute(
-            "INSERT INTO fee_structure (class_name, monthly_fee, annual_charge) VALUES (?, ?, ?)",
-            (cls, monthly, annual)
+
+@app.route("/fees/update_many", methods=["POST"])
+def update_fees_many():
+    data = request.json or {}
+    rows = data.get("fees")
+    if not isinstance(rows, list) or not rows:
+        return jsonify({"success": False, "message": "Missing fees list"}), 400
+
+    sname = get_session_from_request()
+    updated = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cls = normalize_class_name(row.get("class_name"))
+        if not cls:
+            continue
+
+        admission_value = row.get("admission_charge", row.get("admission_fee", 0))
+        exam_value = row.get("exam_charge", row.get("exam_fee", 0))
+        fees_col().update_one(
+            {"session": sname, "class_name": cls},
+            {
+                "$set": {
+                    "monthly_fee": to_int(row.get("monthly_fee", 0), 0),
+                    "annual_charge": to_int(row.get("annual_charge", 0), 0),
+                    "admission_charge": to_int(admission_value, 0),
+                    "admission_fee": to_int(admission_value, 0),
+                    "exam_charge": to_int(exam_value, 0),
+                    "exam_fee": to_int(exam_value, 0),
+                    "updated_at": datetime.utcnow(),
+                },
+                "$setOnInsert": {"created_at": datetime.utcnow()},
+            },
+            upsert=True,
         )
+        updated += 1
 
-    conn.commit()
-    conn.close()
+    return jsonify({"success": True, "message": f"Updated {updated} classes", "updated": updated})
 
-    return jsonify({"success": True, "message": "Updated"})
 
 @app.route("/fees/setup_defaults")
 def setup_fees():
@@ -1138,259 +907,250 @@ def setup_fees():
         "1st": 1300, "2nd": 1300, "3rd": 1300, "4th": 1400, "5th": 1400,
         "6th": 1500, "7th": 1500, "8th": 1700, "9th": 1900, "10th": 1900,
         "11th_Medical": 2200, "11th_Commerce": 2100, "11th_Art": 2100,
-        "12th_Medical": 2200, "12th_Commerce": 2100, "12th_Art": 2100
+        "12th_Medical": 2200, "12th_Commerce": 2100, "12th_Art": 2100,
     }
     sname = get_session_from_request()
-    if sname == DEFAULT_SESSION:
-        with app.app_context():
-            for c, fee in defaults.items():
-                if not FeeStructure.query.filter_by(class_name=c).first():
-                    db.session.add(FeeStructure(class_name=c, monthly_fee=fee))
-            db.session.commit()
-            return jsonify({"success": True, "message": "Inserted"})
-    else:
-        engine = get_engine_for_session(sname)
-        with engine.begin() as conn:
-            for c, fee in defaults.items():
-                res = conn.execute(text("UPDATE fee_structure SET monthly_fee=:m WHERE class_name=:cls"), {"m": fee, "cls": c})
-                if res.rowcount == 0:
-                    conn.execute(text("INSERT INTO fee_structure (class_name, monthly_fee) VALUES (:cls, :m)"), {"cls": c, "m": fee})
-            return jsonify({"success": True, "message": "Inserted"})
+    for cls, fee in defaults.items():
+        fees_col().update_one(
+            {"session": sname, "class_name": cls},
+            {
+                "$set": {"monthly_fee": int(fee), "updated_at": datetime.utcnow()},
+                "$setOnInsert": {"annual_charge": 0, "admission_charge": 0, "exam_charge": 0, "exam_fee": 0, "created_at": datetime.utcnow()},
+            },
+            upsert=True,
+        )
+    return jsonify({"success": True, "message": "Inserted"})
+
+
+@app.route("/exam/config", methods=["GET", "POST"])
+def exam_config():
+    sname = get_session_from_request()
+    if request.method == "GET":
+        doc = exam_cfg_col().find_one({"session": sname}, {"_id": 0})
+        exams = normalize_exam_config((doc or {}).get("exams", []))
+        return jsonify({"success": True, "session": sname, "exams": exams})
+
+    data = request.json or {}
+    exams = normalize_exam_config(data.get("exams", []))
+    exam_cfg_col().update_one(
+        {"session": sname},
+        {"$set": {"session": sname, "exams": exams, "updated_at": datetime.utcnow()}, "$setOnInsert": {"created_at": datetime.utcnow()}},
+        upsert=True,
+    )
+    apply_exam_config_to_students(sname, exams)
+    return jsonify({"success": True, "message": "Exam config updated", "session": sname, "exams": exams})
+
 
 @app.route("/getClassList/<session_name>")
 def get_class_list(session_name):
-    # Query all students for the session, collect unique class_name
-    engine = get_engine_for_session(session_name)
-    if not engine:
-        return jsonify([]), 404
-    with engine.connect() as conn:
-        rows = conn.execute(text("SELECT DISTINCT class_name FROM student")).fetchall()
-        classes = [{"class_name": r._mapping["class_name"]} for r in rows]
-    return jsonify(classes)
+    sname = sanitize_session_name(session_name)
+    classes = students_col().distinct("class_name", {"session": sname})
+    return jsonify([{"class_name": c} for c in sorted([x for x in classes if x])])
 
 
-# ------------------------
-# SESSION LIST
-# ------------------------
-@app.route("/session/list")
-def session_list():
-    files = os.listdir(SESSIONS_DIR)
-    sessions = []
-
-    for f in files:
-        if f.startswith("school_") and f.endswith(".db"):
-            name = f.replace("school_", "").replace(".db", "")
-            sessions.append(name)
-
-    if DEFAULT_SESSION not in sessions:
-        sessions.append(DEFAULT_SESSION)
-
-    try:
-        sessions.sort(key=lambda x: int(x.split("_")[0]))
-    except:
-        pass
-
-    return jsonify({"success": True, "sessions": sessions})
-
-@app.route("/receipt/delete/<int:id>", methods=["DELETE"])
-def delete_receipt(id):
-    try:
-        sname = get_session_from_request()
-        if sname == DEFAULT_SESSION:
-            with app.app_context():
-                rec = Receipt.query.get(id)
-                if not rec:
-                    return jsonify({"success": False, "message": "Receipt not found"}), 404
-                db.session.delete(rec)
-                db.session.commit()
-                return jsonify({"success": True, "message": "Receipt deleted"})
-        engine = get_engine_for_session(sname)
-        with engine.begin() as conn:
-            conn.execute(text("DELETE FROM receipt WHERE id = :rid"), {"rid": id})
-        return jsonify({"success": True, "message": "Receipt deleted"})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-
-@app.route("/receipt/delete_all", methods=["DELETE"])
-def delete_all_receipts():
-    try:
-        sname = get_session_from_request()
-        if sname == DEFAULT_SESSION:
-            with app.app_context():
-                Receipt.query.delete()
-                db.session.commit()
-                return jsonify({"success": True, "message": "All deleted"})
-        engine = get_engine_for_session(sname)
-        with engine.begin() as conn:
-            conn.execute(text("DELETE FROM receipt"))
-        return jsonify({"success": True, "message": "All deleted"})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
-
-from openpyxl import Workbook
-from flask import send_file
-import io, json
-from sqlalchemy import text
-
-MONTHS_ORDER = [
-    "Annual", "Apr", "May", "Jun", "Jul", "Aug",
-    "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar",
-    "previousDue"
-]
+@app.route("/backup/save_all_to_drive", methods=["POST"])
+def backup_all_sessions_to_drive():
+    sessions = [d.get("name") for d in sessions_col().find({}, {"name": 1, "_id": 0}) if d.get("name")]
+    files = [{"session": s, "success": False, "message": "MongoDB mode enabled. Use MongoDB Atlas backup/snapshots.", "file_id": None} for s in sessions]
+    return jsonify({"success": True, "message": "Processed", "files": files})
 
 
 @app.route("/export/excel")
 def export_excel():
     sname = get_session_from_request()
-    engine = get_engine_for_session(sname)
+    students = list(students_col().find({"session": sname}, {"_id": 0}).sort("id", ASCENDING))
+    receipts = list(receipts_col().find({"session": sname}, {"_id": 0}).sort("id", ASCENDING))
 
-    # ----------------------------------------------------
-    # FETCH STUDENTS
-    # ----------------------------------------------------
-    students = []
-    with engine.connect() as conn:
-        rows = conn.execute(text("SELECT * FROM student")).fetchall()
-        for row in rows:
-            students.append(row._mapping)
+    def normalize_export_class(value: Any) -> str:
+        text = str(value or "").strip()
+        text = re.sub(r"\s+", " ", text)
+        # Keep sectioned classes mapped to core class fee (e.g. "11th A" -> "11th").
+        text = re.sub(r"\s+[AB]$", "", text, flags=re.IGNORECASE).strip()
+        return text
 
-    # ----------------------------------------------------
-    # FETCH RECEIPTS
-    # ----------------------------------------------------
-    receipts = []
-    with engine.connect() as conn:
-        rows = conn.execute(text("SELECT * FROM receipt")).fetchall()
-        for row in rows:
-            receipts.append(row._mapping)
+    # Include master students as well, so export is not limited to fee-ledger-created rows.
+    # This keeps Excel aligned with index view where students can come from master backend.
+    master_rows = fetch_master_students_for_session(sname)
+    existing_keys = {
+        f"{normalize_export_class(s.get('class_name'))}|{str(s.get('roll', '')).strip()}": 1
+        for s in students
+    }
+    next_id = max([int(s.get("id", 0) or 0) for s in students] + [0]) + 1
+    for m in master_rows:
+        cls = normalize_export_class(m.get("class_name") or m.get("class") or "")
+        roll = str(m.get("rollno") or m.get("roll") or "").strip()
+        if not cls or not roll:
+            continue
+        key = f"{cls}|{roll}"
+        if key in existing_keys:
+            continue
+        students.append({
+            "session": sname,
+            "id": next_id,
+            "name": m.get("student_name") or m.get("name") or "",
+            "father": m.get("father_name") or m.get("father") or "",
+            "class_name": cls,
+            "roll": roll,
+            "previous_due": 0,
+            "advance": 0,
+            "months": ensure_months_normalized(default_month_structure()),
+            "annual_charge": 0,
+        })
+        existing_keys[key] = 1
+        next_id += 1
 
-    # ----------------------------------------------------
-    # CREATE WORKBOOK
-    # ----------------------------------------------------
+    students.sort(key=lambda s: (normalize_export_class(s.get("class_name")), str(s.get("roll", ""))))
+
+    # Fee defaults by class (used when student fee ledger/month rows are missing).
+    fee_docs = list(fees_col().find({"session": sname}, {"_id": 0}))
+    fee_by_class: Dict[str, Dict[str, int]] = {}
+    for d in fee_docs:
+        cls = normalize_export_class(d.get("class_name"))
+        if not cls:
+            continue
+        fee_by_class[cls] = {
+            "monthly_fee": to_int(d.get("monthly_fee", 0), 0),
+            "annual_charge": to_int(d.get("annual_charge", 0), 0),
+            "admission_charge": to_int(d.get("admission_charge", d.get("admission_fee", 0)), 0),
+        }
+
+    def get_class_defaults(cls_name: str, new_admission: bool):
+        fd = fee_by_class.get(normalize_export_class(cls_name), {})
+        monthly = int(fd.get("monthly_fee", 0) or 0)
+        annual = int(fd.get("annual_charge", 0) or 0)
+        admission = int(fd.get("admission_charge", 0) or 0) if new_admission else 0
+        return monthly, annual + admission
+
+    def norm_month_record(rec: Any, due_default: int):
+        # Match index behavior: if month record is missing, treat as Due by default fee.
+        if not isinstance(rec, dict):
+            return 0, int(due_default), ("Paid" if int(due_default) <= 0 else "Due")
+        paid = to_int(rec.get("paid", 0), 0)
+        due = to_int(rec.get("due", due_default), int(due_default))
+        # If record exists but untouched (paid=0,due=0), apply class default due.
+        # This is common for students that exist in master backend but were never opened in fee ledger.
+        if paid == 0 and due == 0 and int(due_default) > 0:
+            due = int(due_default)
+        status = str(rec.get("status", "") or "").strip()
+        if status not in ("Paid", "Partial", "Due"):
+            if due <= 0 and paid > 0:
+                status = "Paid"
+            elif paid > 0 and due > 0:
+                status = "Partial"
+            else:
+                status = "Due"
+        return paid, due, status
+
+    def build_student_row(st: Dict[str, Any]):
+        cls_name = normalize_export_class(st.get("class_name"))
+        roll = str(st.get("roll", ""))
+        prev_due_default = to_int(st.get("previous_due", 0), 0)
+        new_adm = bool(st.get("new_admission", False))
+        monthly_default, annual_default = get_class_defaults(cls_name, new_adm)
+        months = st.get("months") if isinstance(st.get("months"), dict) else {}
+
+        row = [
+            int(st.get("id", 0) or 0),
+            st.get("name"),
+            st.get("father"),
+            cls_name,
+            roll,
+            prev_due_default,
+            to_int(st.get("advance", 0), 0),
+        ]
+
+        total_paid, total_due = 0, 0
+        for m in MONTHS_ORDER:
+            if m == "previousDue":
+                due_default = prev_due_default
+            elif m == "Annual":
+                due_default = annual_default
+            else:
+                due_default = monthly_default
+            paid, due, status = norm_month_record(months.get(m), due_default)
+            row.extend([paid, status])
+            total_paid += paid
+            total_due += due
+
+        row.extend([total_paid, total_due])
+        return row, total_paid, total_due
+
     wb = Workbook()
-
-    # ====================================================
-    #  SHEET 1: STUDENTS FEE REPORT
-    # ====================================================
     ws = wb.active
     ws.title = "Students Fee Report"
 
     header = ["ID", "Name", "Father", "Class", "Roll", "Previous Due", "Advance"]
-
     for m in MONTHS_ORDER:
-        header.append(f"{m} Paid")
-        header.append(f"{m} Status")
-
-    header += ["Total Paid", "Total Due"]
-
+        header.extend([f"{m} Paid", f"{m} Status"])
+    header.extend(["Total Paid", "Total Due"])
     ws.append(header)
 
-    total_school_paid = 0
-    total_school_due = 0
-    class_summary = {}  # for summary sheet
-
+    total_school_paid, total_school_due, class_summary = 0, 0, {}
     for st in students:
-        months = json.loads(st["months"]) if isinstance(st["months"], str) else st["months"]
-
-        row = [
-            st["id"], st["name"], st["father"],
-            st["class_name"], st["roll"],
-            st.get("previous_due", 0),
-            st.get("advance", 0)
-        ]
-
-        total_paid = 0
-        total_due = 0
-
-        for m in MONTHS_ORDER:
-            rec = months.get(m, {"paid": 0, "due": 0, "status": "Due"})
-
-            paid = rec.get("paid", 0)
-            due = rec.get("due", 0)
-            status = rec.get("status", "Due")
-
-            row.append(paid)
-            row.append(status)
-
-            total_paid += paid
-            total_due += due
-
-        # Add totals
-        row.append(total_paid)
-        row.append(total_due)
-
+        row, total_paid, total_due = build_student_row(st)
         ws.append(row)
 
-        # For summary totals
         total_school_paid += total_paid
         total_school_due += total_due
-
-        # For class wise summary
-        cls = st["class_name"]
+        cls = st.get("class_name")
         if cls not in class_summary:
-            class_summary[cls] = {
-                "students": 0,
-                "paid": 0,
-                "due": 0
-            }
+            class_summary[cls] = {"students": 0, "paid": 0, "due": 0}
         class_summary[cls]["students"] += 1
         class_summary[cls]["paid"] += total_paid
         class_summary[cls]["due"] += total_due
 
-    # ====================================================
-    #  SHEET 2: SUMMARY REPORT
-    # ====================================================
+    # Add one sheet per class containing only that class's students.
+    def safe_sheet_name(name: str, used_names: set):
+        base = str(name or "").strip() or "Unknown"
+        base = re.sub(r"[\\/*?:\[\]]", "_", base)[:31] or "Unknown"
+        candidate = base
+        i = 1
+        while candidate in used_names:
+            suffix = f"_{i}"
+            candidate = (base[: 31 - len(suffix)] + suffix)[:31]
+            i += 1
+        used_names.add(candidate)
+        return candidate
+
+    students_by_class: Dict[str, list] = {}
+    for st in students:
+        cls = str(st.get("class_name") or "Unknown").strip() or "Unknown"
+        students_by_class.setdefault(cls, []).append(st)
+
+    used_sheet_names = {"Students Fee Report"}
+    for cls in sorted(students_by_class.keys(), key=lambda x: x.lower()):
+        ws_cls = wb.create_sheet(safe_sheet_name(cls, used_sheet_names))
+        ws_cls.append(header)
+        for st in students_by_class[cls]:
+            row, _, _ = build_student_row(st)
+            ws_cls.append(row)
+
     ws2 = wb.create_sheet("Summary")
-
     ws2.append(["SUMMARY REPORT"])
-    ws2.append([""])  # blank line
-
+    ws2.append([""])
     ws2.append(["Total Students", len(students)])
     ws2.append(["Total Collection (Paid)", total_school_paid])
     ws2.append(["Total Due", total_school_due])
     ws2.append([""])
-
     ws2.append(["Class", "Students", "Total Paid", "Total Due"])
     for cls, val in class_summary.items():
         ws2.append([cls, val["students"], val["paid"], val["due"]])
 
-    # ====================================================
-    #  SHEET 3: RECEIPTS
-    # ====================================================
     ws3 = wb.create_sheet("Receipts")
-
-    ws3.append([
-        "ID","Name","Father","Class","Roll",
-        "Date","Total Paid","Total Due","Advance",
-        "Annual Charge","Receipt Number","Months (JSON)"
-    ])
-
+    ws3.append(["ID", "Name", "Father", "Class", "Roll", "Date", "Total Paid", "Total Due", "Advance", "Annual Charge", "Receipt Number", "Months (JSON)"])
     for r in receipts:
         ws3.append([
-            r["id"], r["name"], r["father"], r["class_name"], r["roll"],
-            r["date"], r["total_paid"], r["total_due"],
-            r["advance"], r["annual_charge"], r["receipt_number"],
-            r["months_json"]
+            int(r.get("id", 0) or 0), r.get("name"), r.get("father"), r.get("class_name"), r.get("roll"), r.get("date"),
+            int(r.get("total_paid", 0) or 0), int(r.get("total_due", 0) or 0), int(r.get("advance", 0) or 0),
+            int(r.get("annual_charge", 0) or 0), r.get("receipt_number"), json.dumps(r.get("months") or {}),
         ])
 
-    # ----------------------------------------------------
-    # EXPORT FILE
-    # ----------------------------------------------------
-    file_stream = io.BytesIO()
-    wb.save(file_stream)
-    file_stream.seek(0)
-
-    filename = f"School_Report_{sname}.xlsx"
-
-    return send_file(
-        file_stream,
-        download_name=filename,
-        as_attachment=True,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    out = io.BytesIO()
+    wb.save(out)
+    out.seek(0)
+    return send_file(out, download_name=f"School_Report_{sname}.xlsx", as_attachment=True, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
-
-# ------------------------
-# Run
-# ------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=False)
+
