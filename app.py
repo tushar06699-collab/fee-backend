@@ -63,6 +63,10 @@ def exam_cfg_col():
     return db["exam_fee_config"]
 
 
+def transport_routes_col():
+    return db["transport_routes"]
+
+
 def ensure_indexes():
     students_col().create_index([("session", ASCENDING), ("class_name", ASCENDING), ("roll", ASCENDING)], unique=True)
     students_col().create_index([("session", ASCENDING), ("id", ASCENDING)], unique=True)
@@ -70,6 +74,7 @@ def ensure_indexes():
     receipts_col().create_index([("session", ASCENDING), ("id", ASCENDING)], unique=True)
     fees_col().create_index([("session", ASCENDING), ("class_name", ASCENDING)], unique=True)
     exam_cfg_col().create_index([("session", ASCENDING)], unique=True)
+    transport_routes_col().create_index([("session", ASCENDING), ("route_name", ASCENDING)], unique=True)
     sessions_col().create_index([("name", ASCENDING)], unique=True)
 
 
@@ -312,6 +317,11 @@ def student_to_dict(d: Dict[str, Any]):
         "roll": str(d.get("roll", "")),
         "previous_due": int(d.get("previous_due", 0) or 0),
         "advance": int(d.get("advance", 0) or 0),
+        "uses_transport": bool(d.get("uses_transport", False)),
+        "transport_route": str(d.get("transport_route", "") or ""),
+        "transport_fee": int(d.get("transport_fee", 0) or 0),
+        "transport_bus_no": str(d.get("transport_bus_no", "") or ""),
+        "transport_months": int(d.get("transport_months", 0) or 0),
         "months": months,
         "annual_charge": int(d.get("annual_charge", months.get("Annual", {}).get("paid", 0)) or 0),
         "last_payment_method": str(d.get("last_payment_method", "") or ""),
@@ -478,6 +488,11 @@ def add_student():
         "roll": roll,
         "previous_due": int(data.get("previous_due", 0) or 0),
         "advance": int(data.get("advance", 0) or 0),
+        "uses_transport": bool(data.get("uses_transport", False)),
+        "transport_route": str(data.get("transport_route", "") or "").strip(),
+        "transport_fee": int(data.get("transport_fee", 0) or 0),
+        "transport_bus_no": str(data.get("transport_bus_no", "") or "").strip(),
+        "transport_months": max(0, min(12, int(data.get("transport_months", 0) or 0))),
         "months": months,
         "last_payment_method": str(data.get("last_payment_method", "") or ""),
         "payment_methods": {
@@ -558,6 +573,11 @@ def update_student():
                 "father": sdata.get("father", student.get("father")),
                 "previous_due": int(sdata.get("previous_due", student.get("previous_due", 0)) or 0),
                 "advance": int(sdata.get("advance", student.get("advance", 0)) or 0),
+                "uses_transport": bool(sdata.get("uses_transport", student.get("uses_transport", False))),
+                "transport_route": str(sdata.get("transport_route", student.get("transport_route", "")) or "").strip(),
+                "transport_fee": int(sdata.get("transport_fee", student.get("transport_fee", 0)) or 0),
+                "transport_bus_no": str(sdata.get("transport_bus_no", student.get("transport_bus_no", "")) or "").strip(),
+                "transport_months": max(0, min(12, int(sdata.get("transport_months", student.get("transport_months", 0)) or 0))),
                 "months": months,
                 "last_payment_method": str(sdata.get("last_payment_method", student.get("last_payment_method", "")) or ""),
                 "payment_methods": payment_methods,
@@ -939,6 +959,161 @@ def exam_config():
     )
     apply_exam_config_to_students(sname, exams)
     return jsonify({"success": True, "message": "Exam config updated", "session": sname, "exams": exams})
+
+
+@app.route("/transport/routes", methods=["GET", "POST", "DELETE"])
+def transport_routes():
+    sname = get_session_from_request()
+
+    if request.method == "GET":
+        docs = list(
+            transport_routes_col()
+            .find({"session": sname}, {"_id": 0})
+            .sort([("route_name", ASCENDING)])
+        )
+        routes = [{
+            "route_name": normalize_class_name(d.get("route_name")),
+            "route_fee": to_int(d.get("route_fee", 0), 0),
+            "bus_no": str(d.get("bus_no", "") or "").strip(),
+        } for d in docs if normalize_class_name(d.get("route_name"))]
+        return jsonify({"success": True, "session": sname, "routes": routes})
+
+    if request.method == "POST":
+        data = request.get_json() or {}
+        route_name = normalize_class_name(data.get("route_name"))
+        route_fee = max(0, to_int(data.get("route_fee", 0), 0))
+        bus_no = str(data.get("bus_no", "") or "").strip()
+        if not route_name:
+            return jsonify({"success": False, "message": "Missing route_name"}), 400
+
+        transport_routes_col().update_one(
+            {"session": sname, "route_name": route_name},
+            {
+                "$set": {
+                    "route_fee": route_fee,
+                    "bus_no": bus_no,
+                    "updated_at": datetime.utcnow(),
+                },
+                "$setOnInsert": {
+                    "session": sname,
+                    "route_name": route_name,
+                    "created_at": datetime.utcnow(),
+                },
+            },
+            upsert=True,
+        )
+        return jsonify({"success": True, "message": "Route saved"})
+
+    data = request.get_json() or {}
+    route_name = normalize_class_name(data.get("route_name"))
+    if not route_name:
+        return jsonify({"success": False, "message": "Missing route_name"}), 400
+    deleted = transport_routes_col().delete_one({"session": sname, "route_name": route_name}).deleted_count
+    return jsonify({"success": True, "deleted": int(deleted)})
+
+
+@app.route("/transport/students", methods=["GET"])
+def transport_students():
+    sname = get_session_from_request()
+    class_name = normalize_class_name(request.args.get("class_name"))
+
+    master_rows = fetch_master_students_for_session(sname)
+    fee_rows = list(students_col().find({"session": sname}, {"_id": 0}))
+    fee_map = {
+        f"{normalize_class_name(x.get('class_name'))}|{str(x.get('roll', '')).strip()}": x
+        for x in fee_rows
+    }
+
+    out = []
+    for m in master_rows:
+        cls = normalize_class_name(m.get("class_name") or m.get("class"))
+        if not cls:
+            continue
+        if class_name and cls != class_name:
+            continue
+        roll = str(m.get("rollno") or m.get("roll") or "").strip()
+        if not roll:
+            continue
+        key = f"{cls}|{roll}"
+        fs = fee_map.get(key, {})
+
+        uses_transport = bool(fs.get("uses_transport", False))
+        out.append({
+            "name": str(m.get("student_name") or m.get("name") or fs.get("name") or "").strip(),
+            "class_name": cls,
+            "roll": roll,
+            "admission_no": str(m.get("admission_no") or fs.get("admission_no") or "").strip(),
+            "parent_mobile": str(m.get("parent_mobile") or m.get("mobile") or fs.get("parent_mobile") or "").strip(),
+            "uses_transport": uses_transport,
+            "transport_route": str(fs.get("transport_route", "") or "").strip(),
+            "transport_fee": to_int(fs.get("transport_fee", 0), 0),
+            "transport_bus_no": str(fs.get("transport_bus_no", "") or "").strip(),
+            "transport_months": max(0, min(12, to_int(fs.get("transport_months", 12), 12))),
+        })
+
+    out.sort(key=lambda x: (x.get("class_name", ""), to_int(x.get("roll", 0), 0)))
+    return jsonify({"success": True, "students": out})
+
+
+@app.route("/transport/students/save", methods=["POST"])
+def transport_students_save():
+    data = request.get_json() or {}
+    sname = get_session_from_request()
+    rows = data.get("students")
+    if not isinstance(rows, list):
+        return jsonify({"success": False, "message": "Missing students list"}), 400
+
+    saved = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cls = normalize_class_name(row.get("class_name"))
+        roll = str(row.get("roll", "") or "").strip()
+        if not cls or not roll:
+            continue
+
+        uses_transport = bool(row.get("uses_transport", False))
+        route = normalize_class_name(row.get("transport_route"))
+        fee = max(0, to_int(row.get("transport_fee", 0), 0))
+        bus_no = str(row.get("transport_bus_no", "") or "").strip()
+        months = max(1, min(12, to_int(row.get("transport_months", 12), 12)))
+
+        # Ensure fee-student row exists; keep minimal fields if creating new.
+        existing = students_col().find_one({"session": sname, "class_name": cls, "roll": roll}, {"_id": 1, "name": 1, "father": 1})
+        if not existing:
+            students_col().insert_one({
+                "session": sname,
+                "id": get_next_sequence(f"{sname}:student_id"),
+                "name": str(row.get("name", "") or "").strip(),
+                "father": "",
+                "class_name": cls,
+                "roll": roll,
+                "previous_due": 0,
+                "advance": 0,
+                "months": ensure_months_normalized(default_month_structure()),
+                "annual_charge": 0,
+                "scholarship": sanitize_discount_config({}),
+                "concession": sanitize_discount_config({}),
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            })
+
+        students_col().update_one(
+            {"session": sname, "class_name": cls, "roll": roll},
+            {
+                "$set": {
+                    "uses_transport": uses_transport,
+                    "transport_route": route if uses_transport else "",
+                    "transport_fee": fee if uses_transport else 0,
+                    "transport_bus_no": bus_no if uses_transport else "",
+                    "transport_months": months if uses_transport else 0,
+                    "updated_at": datetime.utcnow(),
+                }
+            },
+        )
+        saved += 1
+
+    return jsonify({"success": True, "saved": saved, "message": f"Saved {saved} students"})
 
 
 @app.route("/getClassList/<session_name>")
