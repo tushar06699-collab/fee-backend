@@ -1,9 +1,13 @@
 ﻿
 import io
+import secrets
 import json
+import time
 import os
 import re
 import traceback
+import smtplib
+import ssl
 from datetime import datetime
 from typing import Any, Dict, List
 from urllib.parse import quote
@@ -11,15 +15,40 @@ from urllib.request import Request, urlopen
 
 from flask import Flask, jsonify, make_response, request, send_file
 from flask_cors import CORS
+from email.mime.text import MIMEText
 from openpyxl import Workbook
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
+def load_env_file(path: str = ".env"):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except FileNotFoundError:
+        pass
+
+load_env_file()
 DEFAULT_SESSION = os.getenv("DEFAULT_SESSION", "2024_25")
 CURRENT_SESSION = DEFAULT_SESSION
 # MongoDB connection (hardcoded like exam backend)
 MONGO_URI = "mongodb+srv://PSPS:2007@fee.4uslzr2.mongodb.net/?retryWrites=true&w=majority&appName=fee"
 MONGO_DB_NAME = "school_fee"
+
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+ADMIN_LOGIN_ID = os.getenv("ADMIN_LOGIN_ID", "admin")
+ADMIN_LOGIN_PASS = os.getenv("ADMIN_LOGIN_PASS", "admin123")
+ADMIN_OTP_EMAIL = os.getenv("ADMIN_OTP_EMAIL", "").strip()
 
 client = None
 db = None
@@ -33,6 +62,11 @@ except Exception as e:
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+
+upi_display_state = {"payload": None}
+
+# simple in-memory OTP store: {login_id: {"otp": "123456", "expires": datetime}}
+LOGIN_OTPS: Dict[str, Dict[str, Any]] = {}
 
 MONTHS_ORDER = ["Annual", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar", "previousDue"]
 EXAM_MONTHS_ORDER = ["Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Jan", "Feb", "Mar"]
@@ -50,6 +84,8 @@ def receipts_col():
 def fees_col():
     return db["fee_structure"]
 
+def fee_settings_col():
+    return db["fee_settings"]
 
 def sessions_col():
     return db["sessions"]
@@ -66,6 +102,12 @@ def exam_cfg_col():
 def transport_routes_col():
     return db["transport_routes"]
 
+def stationary_items_col():
+    return db["stationary_items"]
+
+def stationary_receipts_col():
+    return db["stationary_receipts"]
+
 
 def ensure_indexes():
     students_col().create_index([("session", ASCENDING), ("class_name", ASCENDING), ("roll", ASCENDING)], unique=True)
@@ -73,8 +115,13 @@ def ensure_indexes():
     receipts_col().create_index([("session", ASCENDING), ("receipt_key", ASCENDING)], unique=True)
     receipts_col().create_index([("session", ASCENDING), ("id", ASCENDING)], unique=True)
     fees_col().create_index([("session", ASCENDING), ("class_name", ASCENDING)], unique=True)
+    fee_settings_col().create_index([("session", ASCENDING)], unique=True)
     exam_cfg_col().create_index([("session", ASCENDING)], unique=True)
     transport_routes_col().create_index([("session", ASCENDING), ("route_name", ASCENDING)], unique=True)
+    stationary_items_col().create_index([("session", ASCENDING), ("id", ASCENDING)], unique=True)
+    stationary_items_col().create_index([("session", ASCENDING), ("name", ASCENDING)], unique=True)
+    stationary_receipts_col().create_index([("session", ASCENDING), ("receipt_no", ASCENDING)], unique=True)
+    stationary_receipts_col().create_index([("session", ASCENDING), ("class_name", ASCENDING), ("roll", ASCENDING)])
     sessions_col().create_index([("name", ASCENDING)], unique=True)
 
 
@@ -273,6 +320,34 @@ def calc_carry_forward_amount(st: Dict[str, Any]) -> int:
     return prev + sum(int(rec.get("due", 0) or 0) for rec in months.values())
 
 
+def send_bulk_email(to_list: List[str], subject: str, body: str):
+    if not SMTP_USER or not SMTP_PASS:
+        return False, "SMTP credentials not configured"
+    if not to_list:
+        return False, "No recipients"
+
+    context = ssl.create_default_context()
+    msg = MIMEText(body or "", "plain", "utf-8")
+    msg["Subject"] = subject or "Fee Reminder"
+    msg["From"] = SMTP_USER
+
+    failed = []
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+            server.starttls(context=context)
+            server.login(SMTP_USER, SMTP_PASS)
+            for email in to_list:
+                msg["To"] = email
+                try:
+                    server.sendmail(SMTP_USER, [email], msg.as_string())
+                except Exception:
+                    failed.append(email)
+    except Exception as e:
+        return False, str(e)
+
+    return True, failed
+
+
 def ensure_session_exists(session_name: str):
     sname = sanitize_session_name(session_name)
     if sessions_col().find_one({"name": sname}, {"_id": 1}):
@@ -299,6 +374,7 @@ def ensure_session_exists(session_name: str):
             "advance": 0,
             "months": ensure_months_normalized(default_month_structure()),
             "annual_charge": 0,
+            "books_opt_in": bool(s.get("books_opt_in", False)),
             "scholarship": sanitize_discount_config(s.get("scholarship")),
             "concession": sanitize_discount_config(s.get("concession")),
             "created_at": datetime.utcnow(),
@@ -315,6 +391,7 @@ def student_to_dict(d: Dict[str, Any]):
         "father": d.get("father"),
         "class_name": d.get("class_name"),
         "roll": str(d.get("roll", "")),
+        "admission_no": str(d.get("admission_no") or d.get("admission") or ""),
         "previous_due": int(d.get("previous_due", 0) or 0),
         "advance": int(d.get("advance", 0) or 0),
         "uses_transport": bool(d.get("uses_transport", False)),
@@ -324,6 +401,7 @@ def student_to_dict(d: Dict[str, Any]):
         "transport_months": int(d.get("transport_months", 0) or 0),
         "months": months,
         "annual_charge": int(d.get("annual_charge", months.get("Annual", {}).get("paid", 0)) or 0),
+        "books_opt_in": bool(d.get("books_opt_in", False)),
         "last_payment_method": str(d.get("last_payment_method", "") or ""),
         "payment_methods": {
             "cash": int(payment_methods.get("cash", 0) or 0),
@@ -338,12 +416,17 @@ def student_to_dict(d: Dict[str, Any]):
 def receipt_to_dict(d: Dict[str, Any]):
     return {
         "id": int(d.get("id", 0) or 0),
+        "session": d.get("session"),
         "name": d.get("name"),
         "father": d.get("father"),
         "payment_type": d.get("payment_type", ""),
         "admission_no": d.get("admission_no", ""),
         "new_admission": bool(d.get("new_admission", False)),
         "admission_charge": int(d.get("admission_charge", 0) or 0),
+        "registration_fee": int(d.get("registration_fee", 0) or 0),
+        "id_card_fee": int(d.get("id_card_fee", 0) or 0),
+        "books_charge": int(d.get("books_charge", 0) or 0),
+        "books_opt_in": bool(d.get("books_opt_in", False)),
         "scholarship": sanitize_discount_config(d.get("scholarship")),
         "concession": sanitize_discount_config(d.get("concession")),
         "class_name": d.get("class_name"),
@@ -352,8 +435,10 @@ def receipt_to_dict(d: Dict[str, Any]):
         "total_paid": int(d.get("total_paid", 0) or 0),
         "total_due": int(d.get("total_due", 0) or 0),
         "advance": int(d.get("advance", 0) or 0),
+        "latest_paid": int(d.get("latest_paid", 0) or 0),
         "annual_charge": int(d.get("annual_charge", 0) or 0),
         "receipt_number": d.get("receipt_number"),
+        "receipt_key": d.get("receipt_key"),
         "months": d.get("months") or {},
     }
 
@@ -409,6 +494,76 @@ def home():
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "session": get_session_from_request(), "db": "mongodb"})
+
+
+@app.route("/email/send-bulk", methods=["POST"])
+def email_send_bulk():
+    data = request.get_json() or {}
+    emails = data.get("emails")
+    subject = str(data.get("subject") or "Fee Reminder")
+    message = str(data.get("message") or "").strip()
+    if not isinstance(emails, list) or not emails:
+        return jsonify({"success": False, "message": "Missing email list"}), 400
+    if not message:
+        return jsonify({"success": False, "message": "Message is empty"}), 400
+
+    ok, result = send_bulk_email([e for e in emails if isinstance(e, str) and e.strip()], subject, message)
+    if not ok:
+        return jsonify({"success": False, "message": result}), 400
+
+    failed = result if isinstance(result, list) else []
+    return jsonify({
+        "success": True,
+        "sent": len(emails) - len(failed),
+        "failed": failed
+    })
+
+
+@app.route("/auth/otp/request", methods=["POST"])
+def auth_otp_request():
+    data = request.get_json() or {}
+    login_id = str(data.get("login_id") or "").strip()
+    password = str(data.get("password") or "").strip()
+    if not login_id or not password:
+        return jsonify({"success": False, "message": "Missing login_id or password"}), 400
+
+    if login_id != ADMIN_LOGIN_ID or password != ADMIN_LOGIN_PASS:
+        return jsonify({"success": False, "message": "Invalid credentials"}), 401
+
+    if not SMTP_USER or not SMTP_PASS:
+        return jsonify({"success": False, "message": "SMTP credentials not configured"}), 400
+
+    otp = str(secrets.randbelow(1000000)).zfill(6)
+    expires = datetime.utcnow().timestamp() + 5 * 60  # 5 minutes
+    LOGIN_OTPS[login_id] = {"otp": otp, "expires": expires}
+
+    to_email = ADMIN_OTP_EMAIL or SMTP_USER
+    ok, err = send_bulk_email([to_email], "OTP for Fee Login", f"Your OTP is {otp}. It expires in 5 minutes.")
+    if not ok:
+        return jsonify({"success": False, "message": err}), 400
+
+    return jsonify({"success": True, "message": "OTP sent"})
+
+
+@app.route("/auth/otp/verify", methods=["POST"])
+def auth_otp_verify():
+    data = request.get_json() or {}
+    login_id = str(data.get("login_id") or "").strip()
+    otp = str(data.get("otp") or "").strip()
+    if not login_id or not otp:
+        return jsonify({"success": False, "message": "Missing login_id or otp"}), 400
+
+    rec = LOGIN_OTPS.get(login_id)
+    if not rec:
+        return jsonify({"success": False, "message": "OTP not requested"}), 400
+    if datetime.utcnow().timestamp() > float(rec.get("expires", 0)):
+        LOGIN_OTPS.pop(login_id, None)
+        return jsonify({"success": False, "message": "OTP expired"}), 400
+    if otp != rec.get("otp"):
+        return jsonify({"success": False, "message": "Invalid OTP"}), 401
+
+    LOGIN_OTPS.pop(login_id, None)
+    return jsonify({"success": True, "token": f"fee_admin_{login_id}_{int(datetime.utcnow().timestamp())}"})
 
 
 @app.route("/debug/list_dbs")
@@ -486,6 +641,7 @@ def add_student():
         "father": data.get("father"),
         "class_name": cls,
         "roll": roll,
+        "admission_no": str(data.get("admission_no") or data.get("admission") or "").strip(),
         "previous_due": int(data.get("previous_due", 0) or 0),
         "advance": int(data.get("advance", 0) or 0),
         "uses_transport": bool(data.get("uses_transport", False)),
@@ -501,6 +657,7 @@ def add_student():
             "bank": int(((data.get("payment_methods") or {}).get("bank", 0)) or 0),
         },
         "annual_charge": int(months.get("Annual", {}).get("paid", 0) or 0),
+        "books_opt_in": bool(data.get("books_opt_in", False)),
         "scholarship": sanitize_discount_config(data.get("scholarship")),
         "concession": sanitize_discount_config(data.get("concession")),
         "created_at": datetime.utcnow(),
@@ -571,6 +728,7 @@ def update_student():
             "$set": {
                 "name": sdata.get("name", student.get("name")),
                 "father": sdata.get("father", student.get("father")),
+                "admission_no": str(sdata.get("admission_no", student.get("admission_no", "")) or sdata.get("admission") or student.get("admission") or "").strip(),
                 "previous_due": int(sdata.get("previous_due", student.get("previous_due", 0)) or 0),
                 "advance": int(sdata.get("advance", student.get("advance", 0)) or 0),
                 "uses_transport": bool(sdata.get("uses_transport", student.get("uses_transport", False))),
@@ -582,6 +740,7 @@ def update_student():
                 "last_payment_method": str(sdata.get("last_payment_method", student.get("last_payment_method", "")) or ""),
                 "payment_methods": payment_methods,
                 "annual_charge": int(months.get("Annual", {}).get("paid", 0) or 0),
+                "books_opt_in": bool(sdata.get("books_opt_in", student.get("books_opt_in", False))),
                 "scholarship": sanitize_discount_config(sdata.get("scholarship", student.get("scholarship"))),
                 "concession": sanitize_discount_config(sdata.get("concession", student.get("concession"))),
                 "class_name": new_class,
@@ -636,6 +795,7 @@ def add_receipt():
                     "extra": int(item.get("extra", 0) or 0),
                     "date": item.get("date", ""),
                     "exam_fee_applied": int(item.get("exam_fee_applied", 0) or 0),
+                    "transport_fee_applied": int(item.get("transport_fee_applied", 0) or 0),
                 }
         elif isinstance(months_raw, dict):
             for k, v in months_raw.items():
@@ -648,11 +808,50 @@ def add_receipt():
                     "extra": int(vv.get("extra", 0) or 0),
                     "date": vv.get("date", ""),
                     "exam_fee_applied": int(vv.get("exam_fee_applied", 0) or 0),
+                    "transport_fee_applied": int(vv.get("transport_fee_applied", 0) or 0),
                 }
 
         old = receipts_col().find_one({"session": sname, "receipt_key": data["receiptKey"]}, {"_id": 0, "receipt_number": 1})
         if old:
             return jsonify({"success": True, "message": "Duplicate ignored", "receipt_number": old.get("receipt_number")})
+
+        def receipt_signature(payload_months):
+            keys = sorted(payload_months.keys(), key=lambda x: str(x))
+            clean = {}
+            for k in keys:
+                v = payload_months.get(k) or {}
+                clean[str(k)] = {
+                    "paid": int(v.get("paid", 0) or 0),
+                    "due": int(v.get("due", 0) or 0),
+                    "status": str(v.get("status", "") or ""),
+                    "purpose": str(v.get("purpose", "") or ""),
+                    "extra": int(v.get("extra", 0) or 0),
+                    "date": str(v.get("date", "") or ""),
+                    "exam_fee_applied": int(v.get("exam_fee_applied", 0) or 0),
+                    "transport_fee_applied": int(v.get("transport_fee_applied", 0) or 0),
+                }
+            base = {
+                "class": str(data.get("class") or ""),
+                "roll": str(data.get("roll") or ""),
+                "name": str(data.get("name") or ""),
+                "father": str(data.get("father") or ""),
+                "total_paid": int(data.get("totalPaid") or 0),
+                "total_due": int(data.get("totalDue") or 0),
+                "advance": int(data.get("advance") or 0),
+                "months": clean,
+            }
+            return json.dumps(base, sort_keys=True, separators=(",", ":"))
+
+        sig = receipt_signature(months)
+        last = receipts_col().find_one(
+            {"session": sname, "class_name": data["class"], "roll": str(data["roll"])},
+            {"_id": 0, "receipt_number": 1, "receipt_signature": 1, "months": 1, "total_paid": 1, "total_due": 1, "advance": 1},
+            sort=[("id", DESCENDING)],
+        )
+        if last:
+            last_sig = last.get("receipt_signature") or receipt_signature(last.get("months") or {})
+            if last_sig == sig:
+                return jsonify({"success": True, "message": "Duplicate ignored", "receipt_number": last.get("receipt_number")})
 
         rid = get_next_sequence(f"{sname}:receipt_id")
         receipt_number = f"{sname}-{data['class']}-{data['roll']}-{rid:06d}"
@@ -668,6 +867,10 @@ def add_receipt():
             "admission_no": str(data.get("admission_no", "") or ""),
             "new_admission": bool(data.get("new_admission", False)),
             "admission_charge": int(data.get("admission_charge", 0) or 0),
+            "registration_fee": int(data.get("registration_fee", 0) or 0),
+            "id_card_fee": int(data.get("id_card_fee", 0) or 0),
+            "books_charge": int(data.get("books_charge", 0) or 0),
+            "books_opt_in": bool(data.get("books_opt_in", False)),
             "scholarship": sanitize_discount_config(data.get("scholarship")),
             "concession": sanitize_discount_config(data.get("concession")),
             "class_name": data["class"],
@@ -676,8 +879,10 @@ def add_receipt():
             "total_paid": int(data["totalPaid"]),
             "total_due": int(data["totalDue"]),
             "advance": int(data["advance"]),
+            "latest_paid": int(data.get("latest_paid", 0) or 0),
             "months": months,
             "receipt_key": data["receiptKey"],
+            "receipt_signature": sig,
             "annual_charge": annual_paid,
             "receipt_number": receipt_number,
             "created_at": datetime.utcnow(),
@@ -696,6 +901,8 @@ def add_receipt():
 @app.route("/receipt/history")
 def receipt_history():
     sname = get_session_from_request()
+    cls = (request.args.get("class_name") or request.args.get("class") or "").strip()
+    roll = str(request.args.get("roll") or "").strip()
     # Backward-compatible behavior:
     # - If page/page_size are provided, return paginated history.
     # - Otherwise return full history (old behavior).
@@ -703,7 +910,12 @@ def receipt_history():
     size_arg = request.args.get("page_size")
 
     if page_arg is None and size_arg is None:
-        docs = receipts_col().find({"session": sname}, {"_id": 0}).sort("id", DESCENDING)
+        q = {"session": sname}
+        if cls:
+            q["class_name"] = cls
+        if roll:
+            q["roll"] = roll
+        docs = receipts_col().find(q, {"_id": 0}).sort("id", DESCENDING)
         return jsonify({"success": True, "history": [receipt_to_dict(d) for d in docs]})
 
     try:
@@ -717,6 +929,10 @@ def receipt_history():
     page_size = min(max(page_size, 1), 200)
 
     q = {"session": sname}
+    if cls:
+        q["class_name"] = cls
+    if roll:
+        q["roll"] = roll
     total = receipts_col().count_documents(q)
     total_pages = max(1, (total + page_size - 1) // page_size)
     if page > total_pages:
@@ -760,6 +976,453 @@ def delete_all_receipts():
     except Exception as e:
         return jsonify({"success": False, "message": str(e)}), 500
 
+
+@app.route("/upi/display", methods=["GET", "POST", "OPTIONS"])
+def upi_display():
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"})
+    if request.method == "POST":
+        data = request.get_json() or {}
+        # Allow posting an arbitrary payload (for richer tablet screens like result/attendance/fee-structure).
+        # Keep backward compatibility with the older POST shape used for QR.
+        posted_payload = data.get("payload") if isinstance(data.get("payload"), dict) else None
+        if posted_payload is not None:
+            if not posted_payload.get("ts"):
+                posted_payload["ts"] = int(time.time() * 1000)
+            if not posted_payload.get("expiresSec"):
+                posted_payload["expiresSec"] = int(data.get("expiresSec", 600) or 600)
+            upi_display_state["payload"] = posted_payload
+            return jsonify({"success": True})
+
+        upi_display_state["payload"] = {
+            "amount": data.get("amount"),
+            "upiUrl": data.get("upiUrl"),
+            "expiresSec": int(data.get("expiresSec", 600) or 600),
+            "ts": int(data.get("ts", time.time() * 1000) or int(time.time() * 1000)),
+            "studentName": data.get("studentName"),
+            "mode": data.get("mode", "qr"),
+            "student": data.get("student"),
+        }
+        return jsonify({"success": True})
+
+    # Allow GET with query params to set payload (helps avoid CORS/preflight issues)
+    if request.args.get("clear") == "1":
+        upi_display_state["payload"] = None
+        return jsonify({"success": True})
+
+    if request.args.get("mode") == "student":
+        upi_display_state["payload"] = {
+            "mode": "student",
+            "student": {
+                "name": request.args.get("name"),
+                "father": request.args.get("father"),
+                "class": request.args.get("class"),
+                "roll": request.args.get("roll"),
+                "admission_no": request.args.get("admission_no"),
+                "photoUrl": request.args.get("photoUrl"),
+                "totalDue": request.args.get("totalDue"),
+                "latestPaid": request.args.get("latestPaid"),
+                "status": request.args.get("status"),
+            },
+            "ts": int(request.args.get("ts", time.time() * 1000) or int(time.time() * 1000)),
+        }
+        return jsonify({"success": True})
+
+    if request.args.get("mode") == "thanks":
+        upi_display_state["payload"] = {
+            "mode": "thanks",
+            "ts": int(request.args.get("ts", time.time() * 1000) or int(time.time() * 1000)),
+        }
+        return jsonify({"success": True})
+
+    if request.args.get("mode") == "receipt":
+        upi_display_state["payload"] = {
+            "mode": "receipt",
+            "receipt": {
+                "name": request.args.get("name"),
+                "class": request.args.get("class"),
+                "roll": request.args.get("roll"),
+                "admission_no": request.args.get("admission_no"),
+                "totalPaid": request.args.get("totalPaid"),
+                "totalDue": request.args.get("totalDue"),
+                "latestPaid": request.args.get("latestPaid"),
+                "date": request.args.get("date"),
+                "paymentMode": request.args.get("paymentMode"),
+                "status": request.args.get("status"),
+            },
+            "ts": int(request.args.get("ts", time.time() * 1000) or int(time.time() * 1000)),
+        }
+        return jsonify({"success": True})
+
+    if request.args.get("mode") == "cash":
+        upi_display_state["payload"] = {
+            "mode": "cash",
+            "cash": {
+                "name": request.args.get("name"),
+                "admission_no": request.args.get("admission_no"),
+                "amount": request.args.get("amount"),
+                "totalPaid": request.args.get("totalPaid"),
+            },
+            "ts": int(request.args.get("ts", time.time() * 1000) or int(time.time() * 1000)),
+        }
+        return jsonify({"success": True})
+
+    if request.args.get("amount") and request.args.get("upiUrl"):
+        upi_display_state["payload"] = {
+            "amount": request.args.get("amount"),
+            "upiUrl": request.args.get("upiUrl"),
+            "expiresSec": int(request.args.get("expiresSec", 600) or 600),
+            "ts": int(request.args.get("ts", time.time() * 1000) or int(time.time() * 1000)),
+            "studentName": request.args.get("studentName"),
+            "mode": request.args.get("mode", "qr"),
+        }
+        return jsonify({"success": True})
+
+    payload = upi_display_state.get("payload")
+    if not payload:
+        return jsonify({"success": True, "payload": None})
+    expires_ms = int(payload.get("expiresSec", 600) or 600) * 1000
+    ts = int(payload.get("ts", 0) or 0)
+    if ts and (int(time.time() * 1000) - ts) > expires_ms:
+        upi_display_state["payload"] = None
+        return jsonify({"success": True, "payload": None})
+    return jsonify({"success": True, "payload": payload})
+
+
+def stationary_item_to_dict(d: Dict[str, Any]):
+    return {
+        "id": int(d.get("id", 0) or 0),
+        "name": d.get("name"),
+        "price": int(d.get("price", 0) or 0),
+    }
+
+
+@app.route("/stationary/items", methods=["GET", "POST"])
+def stationary_items():
+    sname = get_session_from_request()
+    if request.method == "GET":
+        rows = list(stationary_items_col().find({"session": sname}, {"_id": 0}).sort("name", ASCENDING))
+        return jsonify({"success": True, "items": [stationary_item_to_dict(r) for r in rows]})
+
+    data = request.get_json() or {}
+    name = str(data.get("name") or "").strip()
+    price = max(0, to_int(data.get("price"), 0))
+    if not name:
+        return jsonify({"success": False, "message": "Missing item name"}), 400
+
+    existing = stationary_items_col().find_one({"session": sname, "name": name})
+    if existing:
+        stationary_items_col().update_one(
+            {"session": sname, "name": name},
+            {"$set": {"price": price, "updated_at": datetime.utcnow()}},
+        )
+        updated = stationary_items_col().find_one({"session": sname, "name": name}, {"_id": 0})
+        return jsonify({"success": True, "item": stationary_item_to_dict(updated), "updated": True})
+
+    item_id = get_next_sequence(f"{sname}:stationary_item_id")
+    doc = {"session": sname, "id": item_id, "name": name, "price": price, "created_at": datetime.utcnow()}
+    stationary_items_col().insert_one(doc)
+    return jsonify({"success": True, "item": stationary_item_to_dict(doc), "created": True})
+
+
+@app.route("/stationary/items/<int:item_id>", methods=["PUT", "DELETE"])
+def stationary_item_update_delete(item_id: int):
+    sname = get_session_from_request()
+    if request.method == "DELETE":
+        deleted = stationary_items_col().delete_one({"session": sname, "id": int(item_id)}).deleted_count
+        return jsonify({"success": True, "deleted": int(deleted)})
+
+    data = request.get_json() or {}
+    name = str(data.get("name") or "").strip()
+    price = max(0, to_int(data.get("price"), 0))
+    if not name:
+        return jsonify({"success": False, "message": "Missing item name"}), 400
+
+    if stationary_items_col().find_one({"session": sname, "name": name, "id": {"$ne": int(item_id)}}, {"_id": 1}):
+        return jsonify({"success": False, "message": "Item name already exists"}), 409
+
+    stationary_items_col().update_one(
+        {"session": sname, "id": int(item_id)},
+        {"$set": {"name": name, "price": price, "updated_at": datetime.utcnow()}},
+    )
+    updated = stationary_items_col().find_one({"session": sname, "id": int(item_id)}, {"_id": 0})
+    if not updated:
+        return jsonify({"success": False, "message": "Item not found"}), 404
+    return jsonify({"success": True, "item": stationary_item_to_dict(updated)})
+
+
+@app.route("/stationary/receipt", methods=["POST"])
+def stationary_receipt_add():
+    data = request.get_json() or {}
+    sname = get_session_from_request()
+    required = ["student", "items"]
+    for key in required:
+        if key not in data:
+            return jsonify({"success": False, "message": f"Missing {key}"}), 400
+
+    student = data.get("student") or {}
+    name = str(student.get("name") or "").strip()
+    father = str(student.get("father") or "").strip()
+    class_name = str(student.get("class_name") or student.get("class") or "").strip()
+    roll = str(student.get("roll") or "").strip()
+    admission_no = str(student.get("admission_no") or student.get("admission") or "").strip()
+    if not name or not class_name or not roll:
+        return jsonify({"success": False, "message": "Missing student details"}), 400
+
+    items_in = data.get("items")
+    if not isinstance(items_in, list) or not items_in:
+        return jsonify({"success": False, "message": "No items selected"}), 400
+
+    items_out = []
+    total = 0
+    for raw in items_in:
+        if not isinstance(raw, dict):
+            continue
+        item_id = int(raw.get("id", 0) or 0)
+        name_in = str(raw.get("name") or "").strip()
+        qty = max(1, to_int(raw.get("qty"), 1))
+        price = max(0, to_int(raw.get("price"), 0))
+
+        if item_id:
+            db_item = stationary_items_col().find_one({"session": sname, "id": item_id}, {"_id": 0})
+            if db_item:
+                name_in = db_item.get("name") or name_in
+                price = int(db_item.get("price", price) or price)
+
+        if not name_in:
+            continue
+
+        line_total = price * qty
+        total += line_total
+        items_out.append({
+            "id": item_id,
+            "name": name_in,
+            "price": price,
+            "qty": qty,
+            "total": line_total,
+        })
+
+    if not items_out:
+        return jsonify({"success": False, "message": "No valid items"}), 400
+
+    receipt_no = get_next_sequence(f"{sname}:stationary_receipt")
+    receipt = {
+        "session": sname,
+        "receipt_no": int(receipt_no),
+        "date": data.get("date") or datetime.utcnow().strftime("%Y-%m-%d"),
+        "student_name": name,
+        "father": father,
+        "class_name": class_name,
+        "roll": roll,
+        "admission_no": admission_no,
+        "items": items_out,
+        "total": int(total),
+        "added_to_fee": bool(data.get("added_to_fee", False)),
+        "payment_mode": str(data.get("payment_mode") or "").strip().lower(),
+        "payment_status": str(data.get("payment_status") or "unpaid").strip().lower(),
+        "paid_at": str(data.get("paid_at") or "").strip(),
+        "status_updated_at": "",
+        "created_at": datetime.utcnow(),
+    }
+    stationary_receipts_col().insert_one(receipt)
+    # Remove non-JSON types before returning
+    receipt.pop("_id", None)
+    receipt.pop("created_at", None)
+    return jsonify({"success": True, "receipt": receipt})
+
+
+@app.route("/stationary/add-to-fee", methods=["POST"])
+def stationary_add_to_fee():
+    data = request.get_json() or {}
+    sname = get_session_from_request()
+    student = data.get("student") or {}
+    items_in = data.get("items") or []
+    date_str = str(data.get("date") or "").strip()
+
+    class_name = str(student.get("class_name") or student.get("class") or "").strip()
+    roll = str(student.get("roll") or "").strip()
+    if not class_name or not roll:
+        return jsonify({"success": False, "message": "Missing class or roll"}), 400
+
+    if not isinstance(items_in, list) or not items_in:
+        return jsonify({"success": False, "message": "No items selected"}), 400
+
+    # Calculate total and build purpose text
+    total = 0
+    parts = []
+    for raw in items_in:
+        if not isinstance(raw, dict):
+            continue
+        name_in = str(raw.get("name") or "").strip()
+        qty = max(1, to_int(raw.get("qty"), 1))
+        price = max(0, to_int(raw.get("price"), 0))
+        if not name_in:
+            continue
+        total += price * qty
+        parts.append(f"{name_in}x{qty}")
+
+    if total <= 0:
+        return jsonify({"success": False, "message": "Invalid total"}), 400
+
+    # Month key from date or today
+    try:
+        if date_str:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+        else:
+            dt = datetime.utcnow()
+    except Exception:
+        dt = datetime.utcnow()
+    month_key = dt.strftime("%b")  # Jan, Feb, ...
+
+    student_doc = students_col().find_one({"session": sname, "class_name": class_name, "roll": roll})
+    if not student_doc:
+        return jsonify({"success": False, "message": "Student not found"}), 404
+
+    months = ensure_months_normalized(student_doc.get("months") or {})
+    rec = months.get(month_key) or {"paid": 0, "due": 0, "status": "Due"}
+    rec["due"] = int(rec.get("due", 0) or 0) + int(total)
+    rec["date"] = date_str or dt.strftime("%Y-%m-%d")
+    prev_purpose = str(rec.get("purpose") or "").strip()
+    purpose = ""
+    new_items = ", ".join(parts)
+    base_label = "Stationary: "
+    if prev_purpose:
+        if "Stationary:" in prev_purpose:
+            # Merge items under a single Stationary label.
+            other_parts = []
+            existing_items = []
+            for seg in prev_purpose.split("|"):
+                seg = seg.strip()
+                if not seg:
+                    continue
+                if seg.startswith(base_label):
+                    existing_items.append(seg.replace(base_label, "").strip())
+                else:
+                    other_parts.append(seg)
+            merged_items = ", ".join([x for x in existing_items if x] + ([new_items] if new_items else []))
+            stationary_part = f"{base_label}{merged_items}".strip()
+            combined = " | ".join([p for p in other_parts + [stationary_part] if p])
+            rec["purpose"] = combined
+            purpose = stationary_part
+        else:
+            purpose = f"{base_label}{new_items}".strip()
+            rec["purpose"] = f"{prev_purpose} | {purpose}".strip(" |")
+    else:
+        rec["purpose"] = f"{base_label}{new_items}".strip()
+        purpose = rec["purpose"]
+    paid = int(rec.get("paid", 0) or 0)
+    due = int(rec.get("due", 0) or 0)
+    rec["status"] = "Paid" if due == 0 else ("Partial" if paid > 0 else "Due")
+    months[month_key] = rec
+
+    students_col().update_one(
+        {"session": sname, "class_name": class_name, "roll": roll},
+        {"$set": {"months": months, "updated_at": datetime.utcnow()}},
+    )
+
+    return jsonify({
+        "success": True,
+        "message": "Stationary added to fee ledger",
+        "month": month_key,
+        "total": int(total),
+        "purpose": purpose
+    })
+
+
+@app.route("/stationary/receipt/<int:receipt_no>")
+def stationary_receipt_get(receipt_no: int):
+    sname = get_session_from_request()
+    doc = stationary_receipts_col().find_one({"session": sname, "receipt_no": int(receipt_no)}, {"_id": 0})
+    if not doc:
+        return jsonify({"success": False, "message": "Not found"}), 404
+    return jsonify({"success": True, "receipt": doc})
+
+
+@app.route("/stationary/receipt/<int:receipt_no>/payment", methods=["PUT"])
+def stationary_receipt_payment_update(receipt_no: int):
+    sname = get_session_from_request()
+    data = request.get_json() or {}
+
+    payment_mode = str(data.get("payment_mode") or "").strip().lower()
+    payment_status = str(data.get("payment_status") or "").strip().lower()
+    paid_at = str(data.get("paid_at") or "").strip()
+
+    allowed_modes = {"", "cash", "upi"}
+    allowed_statuses = {"unpaid", "pending", "paid", "not_paid", "cancelled"}
+
+    if payment_mode not in allowed_modes:
+        return jsonify({"success": False, "message": "Invalid payment mode"}), 400
+    if payment_status not in allowed_statuses:
+        return jsonify({"success": False, "message": "Invalid payment status"}), 400
+
+    update_doc = {
+        "payment_mode": payment_mode,
+        "payment_status": payment_status,
+        "status_updated_at": datetime.utcnow().isoformat(),
+    }
+    if payment_status == "paid":
+        update_doc["paid_at"] = paid_at or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    elif "paid_at" in data:
+        update_doc["paid_at"] = paid_at
+
+    stationary_receipts_col().update_one(
+        {"session": sname, "receipt_no": int(receipt_no)},
+        {"$set": update_doc},
+    )
+    updated = stationary_receipts_col().find_one({"session": sname, "receipt_no": int(receipt_no)}, {"_id": 0})
+    if not updated:
+        return jsonify({"success": False, "message": "Not found"}), 404
+    return jsonify({"success": True, "receipt": updated})
+
+
+@app.route("/stationary/receipt/<int:receipt_no>", methods=["DELETE"])
+def stationary_receipt_delete(receipt_no: int):
+    sname = get_session_from_request()
+    deleted = stationary_receipts_col().delete_one({"session": sname, "receipt_no": int(receipt_no)}).deleted_count
+    if not deleted:
+        return jsonify({"success": False, "message": "Not found"}), 404
+    return jsonify({"success": True, "message": "Deleted"})
+
+
+@app.route("/stationary/receipts")
+def stationary_receipts_list():
+    sname = get_session_from_request()
+    cls = (request.args.get("class_name") or request.args.get("class") or "").strip()
+    roll = str(request.args.get("roll") or "").strip()
+    added_to_fee = request.args.get("added_to_fee")
+    page = to_int(request.args.get("page", 1), 1)
+    page_size = to_int(request.args.get("page_size", 10), 10)
+    if page < 1:
+        page = 1
+    if page_size < 1:
+        page_size = 10
+    if page_size > 100:
+        page_size = 100
+    q = {"session": sname}
+    if cls:
+        q["class_name"] = cls
+    if roll:
+        q["roll"] = roll
+    if added_to_fee is not None:
+        q["added_to_fee"] = str(added_to_fee).lower() in ("1","true","yes","y","on")
+    total = stationary_receipts_col().count_documents(q)
+    docs = list(
+        stationary_receipts_col()
+        .find(q, {"_id": 0})
+        .sort("receipt_no", DESCENDING)
+        .skip((page - 1) * page_size)
+        .limit(page_size)
+    )
+    total_pages = (total + page_size - 1) // page_size if page_size else 1
+    return jsonify({
+        "success": True,
+        "receipts": docs,
+        "page": page,
+        "page_size": page_size,
+        "total": int(total),
+        "total_pages": int(total_pages),
+    })
+
 @app.route("/fees/get")
 def fees_get():
     sname = get_session_from_request()
@@ -775,6 +1438,7 @@ def fees_get():
                 "monthly_fee": 0,
                 "annual_charge": 0,
                 "admission_charge": 0,
+                "books_charge": 0,
                 "exam_charge": 0,
                 "created_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
@@ -836,9 +1500,37 @@ def fees_get():
             "monthly_fee": to_int(d.get("monthly_fee", 0), 0),
             "annual_charge": to_int(d.get("annual_charge", 0), 0),
             "admission_charge": to_int(d.get("admission_charge", d.get("admission_fee", 0)), 0),
+            "books_charge": to_int(d.get("books_charge", 0), 0),
             "exam_charge": to_int(d.get("exam_charge", d.get("exam_fee", 0)), 0),
         })
     return jsonify({"success": True, "fees": fees})
+
+@app.route("/fees/settings", methods=["GET"])
+def fees_settings_get():
+    sname = get_session_from_request()
+    doc = fee_settings_col().find_one({"session": sname}, {"_id": 0}) or {}
+    return jsonify({
+        "success": True,
+        "registration_fee": to_int(doc.get("registration_fee", 0), 0),
+        "id_card_fee": to_int(doc.get("id_card_fee", 0), 0),
+    })
+
+@app.route("/fees/settings", methods=["POST"])
+def fees_settings_set():
+    data = request.json or {}
+    sname = get_session_from_request()
+    registration_fee = to_int(data.get("registration_fee", 0), 0)
+    id_card_fee = to_int(data.get("id_card_fee", 0), 0)
+    fee_settings_col().update_one(
+        {"session": sname},
+        {"$set": {
+            "registration_fee": registration_fee,
+            "id_card_fee": id_card_fee,
+            "updated_at": datetime.utcnow(),
+        }, "$setOnInsert": {"created_at": datetime.utcnow()}},
+        upsert=True,
+    )
+    return jsonify({"success": True, "registration_fee": registration_fee, "id_card_fee": id_card_fee})
 
 
 @app.route("/fees/update", methods=["POST"])
@@ -859,6 +1551,7 @@ def update_fee():
                 "annual_charge": to_int(data.get("annual_charge", 0), 0),
                 "admission_charge": to_int(admission_value, 0),
                 "admission_fee": to_int(admission_value, 0),
+                "books_charge": to_int(data.get("books_charge", 0), 0),
                 "exam_charge": to_int(exam_value, 0),
                 "exam_fee": to_int(exam_value, 0),
                 "updated_at": datetime.utcnow(),
@@ -876,6 +1569,7 @@ def update_fee():
             "monthly_fee": to_int((saved or {}).get("monthly_fee", 0), 0),
             "annual_charge": to_int((saved or {}).get("annual_charge", 0), 0),
             "admission_charge": to_int((saved or {}).get("admission_charge", (saved or {}).get("admission_fee", 0)), 0),
+            "books_charge": to_int((saved or {}).get("books_charge", 0), 0),
             "exam_charge": to_int((saved or {}).get("exam_charge", (saved or {}).get("exam_fee", 0)), 0),
         },
     })
@@ -907,6 +1601,7 @@ def update_fees_many():
                     "annual_charge": to_int(row.get("annual_charge", 0), 0),
                     "admission_charge": to_int(admission_value, 0),
                     "admission_fee": to_int(admission_value, 0),
+                    "books_charge": to_int(row.get("books_charge", 0), 0),
                     "exam_charge": to_int(exam_value, 0),
                     "exam_fee": to_int(exam_value, 0),
                     "updated_at": datetime.utcnow(),
