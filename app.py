@@ -1089,11 +1089,28 @@ def upi_display():
     return jsonify({"success": True, "payload": payload})
 
 
+def parse_stationary_sizes(raw: Any):
+    """Normalize an incoming sizes payload into a clean list of {size, price}."""
+    out = []
+    if isinstance(raw, list):
+        for s in raw:
+            if isinstance(s, dict):
+                label = str(s.get("size") or s.get("label") or "").strip()
+                sp = max(0, to_int(s.get("price"), 0))
+            else:
+                label = str(s).strip()
+                sp = 0
+            if label:
+                out.append({"size": label, "price": sp})
+    return out
+
+
 def stationary_item_to_dict(d: Dict[str, Any]):
     return {
         "id": int(d.get("id", 0) or 0),
         "name": d.get("name"),
         "price": int(d.get("price", 0) or 0),
+        "sizes": parse_stationary_sizes(d.get("sizes")),
     }
 
 
@@ -1107,6 +1124,7 @@ def stationary_items():
     data = request.get_json() or {}
     name = str(data.get("name") or "").strip()
     price = max(0, to_int(data.get("price"), 0))
+    sizes = parse_stationary_sizes(data.get("sizes"))
     if not name:
         return jsonify({"success": False, "message": "Missing item name"}), 400
 
@@ -1114,13 +1132,13 @@ def stationary_items():
     if existing:
         stationary_items_col().update_one(
             {"session": sname, "name": name},
-            {"$set": {"price": price, "updated_at": datetime.utcnow()}},
+            {"$set": {"price": price, "sizes": sizes, "updated_at": datetime.utcnow()}},
         )
         updated = stationary_items_col().find_one({"session": sname, "name": name}, {"_id": 0})
         return jsonify({"success": True, "item": stationary_item_to_dict(updated), "updated": True})
 
     item_id = get_next_sequence(f"{sname}:stationary_item_id")
-    doc = {"session": sname, "id": item_id, "name": name, "price": price, "created_at": datetime.utcnow()}
+    doc = {"session": sname, "id": item_id, "name": name, "price": price, "sizes": sizes, "created_at": datetime.utcnow()}
     stationary_items_col().insert_one(doc)
     return jsonify({"success": True, "item": stationary_item_to_dict(doc), "created": True})
 
@@ -1135,6 +1153,7 @@ def stationary_item_update_delete(item_id: int):
     data = request.get_json() or {}
     name = str(data.get("name") or "").strip()
     price = max(0, to_int(data.get("price"), 0))
+    sizes = parse_stationary_sizes(data.get("sizes"))
     if not name:
         return jsonify({"success": False, "message": "Missing item name"}), 400
 
@@ -1143,7 +1162,7 @@ def stationary_item_update_delete(item_id: int):
 
     stationary_items_col().update_one(
         {"session": sname, "id": int(item_id)},
-        {"$set": {"name": name, "price": price, "updated_at": datetime.utcnow()}},
+        {"$set": {"name": name, "price": price, "sizes": sizes, "updated_at": datetime.utcnow()}},
     )
     updated = stationary_items_col().find_one({"session": sname, "id": int(item_id)}, {"_id": 0})
     if not updated:
@@ -1180,14 +1199,27 @@ def stationary_receipt_add():
             continue
         item_id = int(raw.get("id", 0) or 0)
         name_in = str(raw.get("name") or "").strip()
+        size_in = str(raw.get("size") or "").strip()
         qty = max(1, to_int(raw.get("qty"), 1))
         price = max(0, to_int(raw.get("price"), 0))
 
         if item_id:
             db_item = stationary_items_col().find_one({"session": sname, "id": item_id}, {"_id": 0})
             if db_item:
-                name_in = db_item.get("name") or name_in
-                price = int(db_item.get("price", price) or price)
+                base_name = str(db_item.get("name") or name_in or "").strip()
+                base_price = int(db_item.get("price", 0) or 0)
+                db_sizes = parse_stationary_sizes(db_item.get("sizes"))
+                if size_in and db_sizes:
+                    match = next((s for s in db_sizes if s["size"] == size_in), None)
+                    if match:
+                        price = match["price"] if match["price"] > 0 else base_price
+                        name_in = f"{base_name} ({size_in})"
+                    else:
+                        name_in = base_name
+                        price = base_price
+                else:
+                    name_in = base_name
+                    price = base_price
 
         if not name_in:
             continue
@@ -1197,10 +1229,12 @@ def stationary_receipt_add():
         items_out.append({
             "id": item_id,
             "name": name_in,
+            "size": size_in,
             "price": price,
             "qty": qty,
             "total": line_total,
         })
+
 
     if not items_out:
         return jsonify({"success": False, "message": "No valid items"}), 400
